@@ -1,0 +1,14 @@
+[package]
+name = "async-debugger"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# criterion = "0.8.1"
+nix = {version= "0.30.1", features=["ptrace", "event", "signal"]}
+oneshot = {version="0.2.1", features=["std", "async"]}
+smallmap = "1.4.2"
+thiserror = "2.0.18"
+tokio = {version = "1.48.0", features = ["sync"]}
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
