@@ -82,6 +82,13 @@ impl DebugTask {
         })
     }
 
+    pub async fn complete(self) {
+        let (send, reply) = oneshot::channel();
+        let _ = self.sender.send(DebuggerMessage::RemoveTask((self.id, send))).await;
+        let _ = reply.await;
+    }
+
+
     pub fn handle(&self) -> &DebugHandle {
         &self.debug_handle
     }
@@ -139,5 +146,43 @@ impl DebugTask {
         } else {
             None
         }
+    }
+
+    fn force_syscall(&self, mut sys_regs: user_regs_struct) -> Result<()> {
+        self.handle()
+        let regs = self.handle().getregs()?;
+        sys_regs.rip = regs.rip;
+
+        let prev_data = self.handle().read(regs.rip)?;
+        self.handle().write(regs.rip, 0x9090050F)?;
+        self.handle().step(sig)
+
+        let prev_data = ptrace::read(self.pid, regs.rip)?;
+        ptrace::write(self.pid, regs.rip, 0x9090050F)?;
+        ptrace::step(self.pid, 0);
+        waitpid(self.pid, None);
+        let new_regs = ptrace::getregs(self.pid)?;
+        ptrace::setregs(self.pid, regs)?;
+        ptrace::write(self.pid, regs.rip, prev_data)?;
+    }
+
+    fn call_func(&self, mut regs: user_regs_struct) -> Result<user_regs_struct> {
+        let orig_regs = ptrace::getregs(self.pid).unwrap();
+        regs.rip = orig_regs.rip;
+
+        let prev_data = ptrace::read(self.pid, orig_regs.rip)?;
+        ptrace::write(self.pid, orig_regs.rip, 0x90ccd0ff)?;
+        ptrace::cont(self.pid, 0);
+        waitpid(self.pid, None);
+        let new_regs = ptrace::getregs(self.pid)?;
+        ptrace::setregs(self.pid, orig_regs)?;
+        ptrace::write(self.pid, orig_regs.rip, prev_data)?;
+    }
+
+    pub async fn run_syscall(&self, regs: user_regs_struct) -> Result<()> {
+        let old_regs = self.handle().getregs().await?;
+        self.handle().setregs(regs).await?;
+
+        Ok(())
     }
 }

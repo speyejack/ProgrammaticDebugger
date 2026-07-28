@@ -49,6 +49,7 @@ pub(crate) enum DebuggerMessage {
     // TaskWaiting(TaskID),
     // TODO: Need some way to delete tasks
     CreateNewTask(oneshot::Sender<TaskID>),
+    RemoveTask((TaskID, oneshot::Sender<()>)),
 
     Continue((TaskID, oneshot::Sender<()>)),
     Step((TaskID, oneshot::Sender<()>)),
@@ -224,6 +225,22 @@ impl Debugger {
         self.is_stopped
     }
 
+    fn handle_task_send<T>(
+        &mut self,
+        res: std::result::Result<(), oneshot::SendError<T>>,
+        id: TaskID,
+        status: TaskStatus,
+    ) {
+        match res {
+            Ok(_) => {
+                self.tstatus.insert(id, status);
+            }
+            Err(_) => {
+                self.tstatus.remove(&id);
+            }
+        }
+    }
+
     async fn handle_ext_event(&mut self, event: DebuggerMessage) -> Result<()> {
         // Likely this will be called during handling of running until waitpid & during waiting for tasks, continue & step shouldnt happen during waitpid/running.
         // during running.
@@ -233,8 +250,14 @@ impl Debugger {
                 let id = self.next_id;
                 self.next_id += 1;
 
-                self.tstatus.insert(id, TaskStatus::Running);
-                let _ = sender.send(id);
+                self.handle_task_send(sender.send(id), id, TaskStatus::Running);
+                return Ok(());
+            }
+            DebuggerMessage::RemoveTask((id, sender)) => {
+                tracing::debug!("Debugger removing task");
+
+                self.tstatus.remove(&id);
+                let _ = sender.send(());
                 return Ok(());
             }
             DebuggerMessage::Continue((id, sender)) => {
@@ -303,7 +326,8 @@ impl Debugger {
                 local_bk.1 = hw_bk;
                 let _ = self.hw_bps[hw_bk.id].insert(local_bk);
                 println!("Modified breakpoint");
-                let _ = sender.send(());
+
+                let _ = sender.send(()).with_err("debugger modify hw bp reply");
             }
             DebuggerMessage::DeleteHwBreakpoint((mut hw_bk, sender)) => {
                 tracing::debug!("Debugger deleted hw breakpoint");
