@@ -1,7 +1,13 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_debugger::Result;
-use nix::{sys::ptrace, unistd::Pid};
+use nix::{
+    sys::{
+        mman::{MapFlags, ProtFlags},
+        ptrace,
+    },
+    unistd::Pid,
+};
 use tracing::level_filters::LevelFilter;
 
 fn main() -> Result<()> {
@@ -40,7 +46,7 @@ fn main() -> Result<()> {
             task.interrupt().await.unwrap();
             println!("Tracee interrupted");
 
-            let _backup_task = task.create_task().await?;
+            let mmap_task = task.create_task().await?;
 
             tokio::spawn(async move {
                 println!("creating breakpoint");
@@ -60,22 +66,42 @@ fn main() -> Result<()> {
                 loop {
                     let regs = hw_bk.wait_break().await.unwrap();
                     *found.lock().await.entry(regs.rip).or_insert(0) += 1;
-                    task.cont().await.unwrap();
+                    let res = task.cont().await;
+                    if let Err(e) = res {
+                        break;
+                    }
                 }
             });
 
-            let _ = _backup_task.cont().await;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                println!("Mmapping region");
+                let addr = mmap_task
+                    .call_mmap(None, 0x1000, ProtFlags::all(), MapFlags::MAP_PRIVATE)
+                    .await
+                    .unwrap();
+                println!("Region allocated: {addr:x}");
+                let _ = mmap_task.cont().await;
+                println!("Task resumed");
+                tokio::time::sleep(Duration::from_secs(9)).await;
+                // mmap_task.complete().await;
+                // println!("Task complete");
+                println!("Attempting shutdown");
+                let _ = mmap_task.interrupt().await;
+                mmap_task.req_shutdown().await;
+            });
 
             let lock = found_map.lock().await;
             println!("Lock: {:x?}", *lock);
             drop(lock);
 
-            loop {
+            for i in 0..10 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let lock = found_map.lock().await;
                 println!("Lock: {:x?}", *lock);
                 drop(lock);
             }
+            Ok(())
         })
 }
 
