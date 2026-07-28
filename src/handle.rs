@@ -12,7 +12,7 @@ use nix::{
         eventfd::{EfdFlags, EventFd},
         ptrace::{self, AddressType, RegisterSet},
         signal::Signal,
-        wait::{WaitPidFlag, WaitStatus},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
     },
     unistd::Pid,
 };
@@ -128,6 +128,16 @@ impl DebugHandle {
             .await
     }
 
+    pub async fn raw_waitpid<T>(&self, flags: T) -> Result<WaitStatus>
+    where
+        T: Into<Option<WaitPidFlag>>,
+    {
+        let options = flags.into();
+
+        self.send_cmd(move |pid| waitpid(pid, options), "waitpid")
+            .await
+    }
+
     pub async fn detach<T>(self, sig: T) -> Result<()>
     where
         T: Into<Option<Signal>>,
@@ -169,7 +179,7 @@ impl DebugHandle {
         self.send_cmd(move |pid| ptrace::kill(pid), "kill").await
     }
 
-    pub async fn read(&self, addr: usize) -> Result<c_long> {
+    pub async fn read(&self, addr: u64) -> Result<c_long> {
         self.send_cmd(move |pid| ptrace::read(pid, addr as AddressType), "read")
             .await
     }
@@ -251,7 +261,7 @@ impl DebugHandle {
             .await
     }
 
-    pub async fn write(&self, addr: usize, data: c_long) -> Result<()> {
+    pub async fn write(&self, addr: u64, data: c_long) -> Result<()> {
         self.send_cmd(
             move |pid| ptrace::write(pid, addr as AddressType, data),
             "write",
