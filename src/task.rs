@@ -1,5 +1,9 @@
-use std::sync::Arc;
+#[cfg(feature = "mmap")]
+use std::num::NonZeroU64;
+use std::{num::NonZeroUsize, os::fd::AsFd, sync::Arc};
 
+#[cfg(feature = "mmap")]
+use nix::sys::mman::{MapFlags, ProtFlags};
 use nix::{libc::user_regs_struct, sys::wait::WaitPidFlag};
 use tokio::sync::mpsc;
 
@@ -188,5 +192,31 @@ impl DebugTask {
         self.handle().write(orig_regs.rip, prev_data).await?;
 
         Ok(new_regs)
+    }
+
+    #[cfg(feature = "mmap")]
+    pub async fn call_mmap(
+        &self,
+        addr: Option<NonZeroU64>,
+        length: u64,
+        prot: ProtFlags,
+        flags: MapFlags,
+    ) -> Result<u64> {
+        let mut regs = self.handle().getregs().await?;
+        let addr = addr.map(|x| x.into()).unwrap_or(0);
+        let length = length.into();
+        let flags = flags | MapFlags::MAP_ANONYMOUS;
+
+        regs.rax = 9;
+        regs.rdi = addr;
+        regs.rsi = length;
+        regs.rdx = prot.bits() as u64;
+        regs.r10 = flags.bits() as u64;
+        regs.r8 = 0_u64.wrapping_sub(1);
+        regs.r9 = 0;
+
+        let out = self.call_syscall(regs).await?;
+
+        Ok(out.rax)
     }
 }

@@ -20,3 +20,7 @@ tokio = {version = "1.48.0", features = ["sync", "macros", "rt", "time"]}
 
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
+
+[features]
+default = ["mmap"]
+mmap = ["nix/mman"]
