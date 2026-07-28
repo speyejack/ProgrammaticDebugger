@@ -86,6 +86,10 @@ impl DebugTask {
         })
     }
 
+    pub async fn req_shutdown(self) {
+        let _ = self.sender.send(DebuggerMessage::GracefulShutdown).await;
+    }
+
     pub async fn complete(self) {
         let (send, reply) = oneshot::channel();
         let _ = self

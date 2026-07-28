@@ -4,12 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use nix::{
-    libc::user_regs_struct,
-    poll::PollTimeout,
-    sys::wait::{WaitPidFlag, WaitStatus},
-    unistd::Pid,
-};
+use nix::{libc::user_regs_struct, sys::wait::WaitStatus, unistd::Pid};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -67,6 +62,7 @@ pub(crate) enum DebuggerMessage {
     ),
     ModifyHwBreakpoint((HardwareBreakpoint, oneshot::Sender<()>)),
     DeleteHwBreakpoint((HardwareBreakpoint, Option<oneshot::Sender<()>>)),
+    GracefulShutdown,
 }
 
 impl Debugger {
@@ -120,10 +116,14 @@ impl Debugger {
                     tracing::debug!("Debugger got event from tasks");
                     match event {
                         Some(event) => {
-                            let e = self.handle_ext_event(event).await;
+                            let o = self.handle_ext_event(event).await;
 
-                            if let Err(e) = e {
-                                tracing::warn!("Error in ext event: {e}");
+                            match o {
+                                Ok(false) => break,
+                                Err(e) => {
+                                    tracing::warn!("Error in ext event: {e}");
+                                }
+                                _ => {},
                             }
 
                         },
@@ -241,7 +241,7 @@ impl Debugger {
         }
     }
 
-    async fn handle_ext_event(&mut self, event: DebuggerMessage) -> Result<()> {
+    async fn handle_ext_event(&mut self, event: DebuggerMessage) -> Result<bool> {
         // Likely this will be called during handling of running until waitpid & during waiting for tasks, continue & step shouldnt happen during waitpid/running.
         // during running.
         match event {
@@ -251,7 +251,7 @@ impl Debugger {
                 self.next_id += 1;
 
                 self.handle_task_send(sender.send(id), id, TaskStatus::Running);
-                return Ok(());
+                return Ok(true);
             }
             DebuggerMessage::RemoveTask((id, sender)) => {
                 tracing::debug!("Debugger removing task");
@@ -283,7 +283,7 @@ impl Debugger {
                 self.tstatus.insert(id, TaskStatus::Waiting);
                 self.on_interrupt.push((id, sender));
 
-                return Ok(());
+                return Ok(true);
             }
             DebuggerMessage::ReqControl((id, sender)) => {
                 tracing::debug!("Task {id} requested control from debugger");
@@ -345,10 +345,30 @@ impl Debugger {
 
                 sender.map(|s| s.send(()));
             }
+            DebuggerMessage::GracefulShutdown => {
+                if !self.is_stopped {
+                    tracing::warn!("Tried shutdown debugger while running");
+                    return Ok(true);
+                }
+
+                for maybe_hwbp in self.hw_bps.iter_mut() {
+                    if let Some((task_id, bp, sender)) = maybe_hwbp.take() {
+                        let _ = self.handle.write_user(bp.dx_addr(), 0).await;
+                    }
+                }
+
+                let _ = self
+                    .handle
+                    .write_user(HardwareBreakpoint::d7_addr(), 0)
+                    .await;
+                let _ = self.handle.cont(None).await;
+                tracing::info!("Debugger shutting down");
+                return Ok(false);
+            }
         }
 
         self.attempt_resume().await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn attempt_resume(&mut self) -> Result<()> {
