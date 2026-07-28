@@ -258,7 +258,6 @@ impl Debugger {
 
                 self.tstatus.remove(&id);
                 let _ = sender.send(());
-                return Ok(());
             }
             DebuggerMessage::Continue((id, sender)) => {
                 tracing::debug!("Debugger got {id} wants continue");
