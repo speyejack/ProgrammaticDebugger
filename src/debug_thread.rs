@@ -1,134 +1,139 @@
 use std::{
     os::fd::AsFd,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
 };
 
-use crate::{Result, comms::ProcCmd};
+use crate::{Result, comms::ProcCmd, err::FromPtraceExt};
 
 use nix::{
-    poll::{self, PollFd, PollFlags, PollTimeout},
+    libc::siginfo_t,
     sys::{
-        eventfd::EventFd,
         ptrace::{self},
-        signal::{SigSet, SigmaskHow, Signal, sigprocmask},
-        signalfd::{SfdFlags, SignalFd},
+        signal::Signal,
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
     unistd::Pid,
 };
 
+pub const INTERRUPT_SIGNAL: Signal = Signal::SIGUSR1;
+
 pub struct ProcThread {
     pid: Pid,
-    alert_fd: Arc<EventFd>,
-    sigfd: SignalFd,
+    tracee_running: bool,
+
+    interrupting: Arc<Mutex<bool>>,
     cmds: mpsc::Receiver<ProcCmd>,
+    // tokio here can likely can be replaced
+    // with future::mpsc
+    event_watch: tokio::sync::mpsc::Sender<Result<StopBatch>>,
+}
+
+pub struct StopBatch {
+    pub events: Vec<(WaitStatus, Option<siginfo_t>)>,
+    pub was_interrupt: bool,
 }
 
 impl ProcThread {
-    pub fn new(pid: Pid, cmds: mpsc::Receiver<ProcCmd>, alert_fd: Arc<EventFd>) -> Self {
-        let sigfd = create_sigchld_fd().unwrap();
-
+    pub fn new(
+        pid: Pid,
+        interrupting: Arc<Mutex<bool>>,
+        cmds: mpsc::Receiver<ProcCmd>,
+        event_watch: tokio::sync::mpsc::Sender<Result<StopBatch>>,
+    ) -> Self {
         ProcThread {
             pid,
-            alert_fd,
-            sigfd,
+            tracee_running: false,
+            interrupting,
             cmds,
+            event_watch,
         }
     }
 
-    pub fn event_loop(mut self) {
+    pub fn event_loop(mut self) -> Result<()> {
         use ProcCmd::*;
-
-        loop {
-            let recv_cmd = self.cmds.recv();
-            if let Ok(cmd) = recv_cmd {
-                match cmd {
-                    WaitEvent(flags, sender) => {
-                        let res = self.wait_event(flags);
-                        let _ = sender.send(res);
-                    }
-                    WaitPid(flags, sender) => {
-                        let res = self.wait_pid(flags);
-                        let _ = sender.send(res);
-                    }
-
-                    Cmd(func) => func(self.pid),
+        'event_loop: loop {
+            if self.tracee_running {
+                tracing::debug!("ProcThread waiting for tracee stop");
+                let batch = self.wait_stop();
+                if let Err(e) = self.event_watch.try_send(batch) {
+                    tracing::debug!("ProcThread closing due to event watch: {e}");
+                    break;
                 }
-            } else {
-                break;
+
+                self.tracee_running = false;
             }
+
+            'cmd_loop: loop {
+                let recv_cmd = self.cmds.recv();
+                if let Ok(cmd) = recv_cmd {
+                    match cmd {
+                        Cmd(func) => func(self.pid),
+                        Seize(options, sender) => {
+                            let out = ptrace::seize(self.pid, options).with_err("seize", self.pid);
+                            let _ = sender.send(out);
+                            break 'cmd_loop;
+                        }
+                        Attach(sender) => {
+                            let out = ptrace::attach(self.pid).with_err("attach", self.pid);
+                            let _ = sender.send(out);
+                        }
+                        Continue(signal, sender) => {
+                            let out = ptrace::cont(self.pid, signal).with_err("continue", self.pid);
+                            let _ = sender.send(out);
+                            break 'cmd_loop;
+                        }
+                        Step(signal, sender) => {
+                            let out = ptrace::step(self.pid, signal).with_err("step", self.pid);
+                            let _ = sender.send(out);
+                            break 'cmd_loop;
+                        }
+                    }
+                } else {
+                    break 'event_loop;
+                }
+            }
+            self.tracee_running = true;
         }
+
+        tracing::info!("Proc Thread terminating");
+        Ok(())
     }
 
-    fn wait_event(&mut self, flags: Option<WaitPidFlag>) -> Result<(WaitStatus, bool)> {
-        let mut fds = [
-            PollFd::new(self.sigfd.as_fd(), PollFlags::POLLIN),
-            PollFd::new(self.alert_fd.as_fd(), PollFlags::POLLIN),
-        ];
-        // let _poll_event = poll::poll(&mut fds, PollTimeout::NONE);
-        let _poll_event = poll::poll(&mut fds, PollTimeout::from(10u16));
+    pub fn wait_stop(&mut self) -> Result<StopBatch> {
+        let mut events = Vec::new();
 
-        let has_sigfd_event = fds[0]
-            .revents()
-            .unwrap_or(PollFlags::empty())
-            .contains(PollFlags::POLLIN);
+        let mut event = self.wait_pid(Some(WaitPidFlag::empty()))?;
 
-        let has_alert = fds[1]
-            .revents()
-            .unwrap_or(PollFlags::empty())
-            .contains(PollFlags::POLLIN);
+        let mut lock = self.interrupting.lock().expect("Poisoned Interrupt Lock");
+        let was_interrupt = *lock;
+        *lock = false;
+        drop(lock);
 
-        if has_alert {
-            let _event = self.alert_fd.read();
-            let _ = ptrace::interrupt(self.pid);
-        }
-
-        if has_sigfd_event {
-            let _sig = self.sigfd.read_signal();
-        }
-
-        // tracing::trace!("Debug waitpid event");
-        let res = self.wait_pid(flags)?;
-
-        // let mut flags = None;
-        // flags = Some(WaitPidFlag::WNOHANG);
-        // let mut hit_count = 0;
-        // 'pidloop: loop {
-        //     let event = waitpid(pid, flags);
-        //     flags = Some(WaitPidFlag::WNOHANG);
-        //     match event {
-        //         Ok(WaitStatus::StillAlive) => break 'pidloop,
-        //         Ok(WaitStatus::Stopped(_, _)) => {}
-        //         e => {
-        //             tracing::warn!("Unhandled event: {event:?}");
-        //         }
-        //     }
-        //     hit_count += 1;
-        // }
-        //
-        // tracing::trace!("Debug event looped {hit_count} times");
-        // Drain read signal
+        tracing::trace!("Got event, stopping tracee");
+        let mut unhandled_interrupt = was_interrupt;
         loop {
-            if let Ok(None) = self.sigfd.read_signal() {
-                break;
-            }
-        }
+            match event {
+                WaitStatus::StillAlive => break,
+                WaitStatus::Stopped(_, sig) if unhandled_interrupt && sig == INTERRUPT_SIGNAL => {
+                    unhandled_interrupt = true;
+                }
 
-        Ok((res, has_alert))
-        // tracing::trace!("Event: {event:?}");
+                status => {
+                    events.push((status, None));
+                }
+            }
+
+            event = self.wait_pid(Some(WaitPidFlag::WNOHANG))?;
+        }
+        tracing::trace!("Tracee stopped");
+
+        Ok(StopBatch {
+            events,
+            was_interrupt,
+        })
     }
 
     fn wait_pid(&mut self, flags: Option<WaitPidFlag>) -> Result<WaitStatus> {
-        waitpid(self.pid, flags).map_err(Into::into)
+        waitpid(self.pid, flags).with_err("waitpid", self.pid)
     }
-}
-
-pub fn create_sigchld_fd() -> nix::Result<SignalFd> {
-    // Block SIGCHLD so it doesn't get delivered normally
-    let mut mask = SigSet::empty();
-    mask.add(Signal::SIGCHLD);
-    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
-
-    // Now create an fd that will become readable when SIGCHLD fires
-    SignalFd::with_flags(&mask, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
 }

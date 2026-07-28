@@ -1,113 +1,117 @@
-mod comms;
-mod debug_thread;
-mod err;
-mod handle;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-pub use err::Result;
+use async_debugger::Result;
+use nix::{sys::ptrace, unistd::Pid};
+use tracing::level_filters::LevelFilter;
 
-use std::{
-    collections::HashMap,
-    mem::offset_of,
-    sync::{Arc, Mutex},
-};
+fn main() -> Result<()> {
+    setup_logging();
+    let (pid, addr) = get_prog_info();
+    println!("Attaching to {pid} and watching {addr:x}");
 
-use nix::{
-    libc::user_regs_struct,
-    sys::{
-        ptrace,
-        wait::{WaitPidFlag, WaitStatus},
-    },
-    unistd::Pid,
-};
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .name("my-runtime")
+        .build()
+        .unwrap()
+        .block_on(async {
+            let found_map = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let found = found_map.clone();
 
-use crate::handle::DebugHandle;
+            println!("Quick setup happening");
+            let (debugger, task, thread) = async_debugger::Debugger::quick_setup(pid).await?;
+            println!("Performed quick_setup");
 
-pub async fn mvp_debugger(
-    pid: Pid,
-    data_loc: i64,
-    found: Arc<Mutex<HashMap<u64, (usize, Option<user_regs_struct>)>>>,
-) {
-    tracing::trace!("Starting Debugger");
-
-    let (mut handle, thread) = DebugHandle::setup_debugger(pid).unwrap();
-    let join_handle = std::thread::spawn(move || {
-        thread.event_loop();
-    });
-
-    let debug_offset = offset_of!(nix::libc::user, u_debugreg);
-    let d0o = debug_offset;
-    let d6o = debug_offset + 6 * 8;
-    let d7o = debug_offset + 7 * 8;
-
-    handle.seize(ptrace::Options::empty()).await.unwrap();
-    tracing::trace!("Process seized");
-    handle.raw_interrupt().await.unwrap();
-    handle.wait_event(None).await.unwrap();
-    tracing::trace!("Process interrupted");
-
-    let d7set = 0b10 << (0 * 4 + 18) // Size byte 8
-        | 0x0100 // recommended to have this local exact breakpoint
-        | 0b01 << (0 * 4 + 16) // Write
-        | 0b01 << (0 * 2);
-
-    tracing::trace!("d7: {d7set:x}");
-    handle.write_user(d0o, data_loc).await.unwrap();
-    handle.write_user(d7o, d7set).await.unwrap();
-    let _o = handle.read_user(d6o).await.unwrap();
-    handle.cont(None).await.unwrap();
-    tracing::trace!("Starting loop");
-
-    loop {
-        let (event, was_interrupt) = handle.wait_event(Some(WaitPidFlag::WNOHANG)).await.unwrap();
-        if was_interrupt {
-            break;
-        }
-
-        let mut event = Ok(event);
-        'pidloop: loop {
-            match event {
-                Ok(WaitStatus::StillAlive) => break 'pidloop,
-                Ok(WaitStatus::Stopped(_, _)) => {
-                    let regs = ptrace::getregs(pid).unwrap();
-                    let loc = regs.rip;
-                    let regs = handle.getregs().await.unwrap();
-
-                    let mut map = found.lock().unwrap();
-                    let count = map.entry(loc).or_default();
-                    (*count).0 += 1;
-                    (*count).1 = Some(regs);
-                    // tracing::trace!(loc, count.0, "Stored location");
-                    handle.write_user(d6o, 0).await.unwrap();
+            std::thread::spawn(move || {
+                let out = thread.event_loop();
+                if let Err(e) = out {
+                    tracing::error!("Proc Thread terminated: {e:#?}");
                 }
-                ref e => {
-                    tracing::warn!("Unhandled event: {e:?}");
+            });
+
+            tokio::spawn(async move {
+                debugger.event_loop().await;
+            });
+
+            println!("Spawned all events");
+            task.handle().seize(ptrace::Options::empty()).await?;
+            println!("Tracee seized");
+
+            task.interrupt().await.unwrap();
+            println!("Tracee interrupted");
+
+            let _backup_task = task.create_task().await?;
+
+            tokio::spawn(async move {
+                println!("creating breakpoint");
+                let mut hw_bk = task.create_hw_bkpt().await.unwrap();
+                hw_bk
+                    .modify(|bk| {
+                        bk.is_enable(true)
+                            .location(addr)
+                            .condition(async_debugger::HwBreakpointCond::Write)
+                            .size(async_debugger::HwBreakpointSize::Bytes4)
+                    })
+                    .await
+                    .unwrap();
+                println!("Hw bkpt now set");
+
+                task.cont().await.unwrap();
+                loop {
+                    let regs = hw_bk.wait_break().await.unwrap();
+                    *found.lock().await.entry(regs.rip).or_insert(0) += 1;
+                    task.cont().await.unwrap();
                 }
-            };
-            event = handle.wait_pid(Some(WaitPidFlag::WNOHANG)).await;
-        }
-    }
+            });
 
-    tracing::trace!("Finishing loop");
+            let _ = _backup_task.cont().await;
 
-    handle.raw_interrupt().await.unwrap();
-    handle.wait_pid(None).await.unwrap();
+            let lock = found_map.lock().await;
+            println!("Lock: {:x?}", *lock);
+            drop(lock);
 
-    handle.write_user(d7o, 0).await.unwrap();
-    handle.write_user(d0o, 0).await.unwrap();
-    handle.write_user(d6o, 0).await.unwrap();
-
-    loop {
-        let e = handle.wait_pid(Some(WaitPidFlag::WNOHANG)).await.unwrap();
-        if matches!(e, nix::sys::wait::WaitStatus::StillAlive) {
-            break;
-        }
-        tracing::trace!("Oops backed up event");
-    }
-
-    handle.detach(None).await.unwrap();
-    join_handle.join().unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let lock = found_map.lock().await;
+                println!("Lock: {:x?}", *lock);
+                drop(lock);
+            }
+        })
 }
 
-fn main() {
-    println!("Hello, world!");
+fn get_prog_info() -> (Pid, i64) {
+    let (pid, addr_str) = get_prog_info_from_cmd()
+        .or_else(get_prog_info_from_file)
+        .unwrap();
+    let pid = Pid::from_raw(pid);
+    let addr = i64::from_str_radix(addr_str.strip_prefix("0x").unwrap_or(&addr_str), 16).unwrap();
+    (pid, addr)
+}
+
+fn get_prog_info_from_cmd() -> Option<(i32, String)> {
+    let pid: i32 = std::env::args().nth(1)?.parse().ok()?;
+    let addr = std::env::args().nth(2)?;
+    Some((pid, addr))
+}
+
+fn get_prog_info_from_file() -> Option<(i32, String)> {
+    let filename = std::env::args().nth(1)?;
+    let string = std::fs::read_to_string(filename).ok()?;
+
+    let (pid_str, addr_str) = string.split_once(' ')?;
+    let pid = pid_str.trim().parse().ok()?;
+    let addr = addr_str.trim().to_string();
+
+    Some((pid, addr))
+}
+
+fn setup_logging() {
+    // console_subscriber::init();
+    let level = LevelFilter::INFO.into();
+
+    let env_filter = tracing_subscriber::filter::EnvFilter::builder()
+        .with_default_directive(level)
+        .from_env_lossy();
+
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 }

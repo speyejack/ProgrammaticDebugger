@@ -1,16 +1,19 @@
 use nix::{
-    sys::wait::{WaitPidFlag, WaitStatus},
+    poll::PollTimeout,
+    sys::{
+        ptrace,
+        signal::Signal,
+        wait::{WaitPidFlag, WaitStatus},
+    },
     unistd::Pid,
 };
 
 use crate::Result;
 
 pub enum ProcCmd {
-    WaitEvent(
-        Option<WaitPidFlag>,
-        oneshot::Sender<Result<(WaitStatus, bool)>>,
-    ),
-    WaitPid(Option<WaitPidFlag>, oneshot::Sender<Result<WaitStatus>>),
+    Attach(oneshot::Sender<Result<()>>),
+    Seize(ptrace::Options, oneshot::Sender<Result<()>>),
+    Continue(Option<Signal>, oneshot::Sender<Result<()>>),
+    Step(Option<Signal>, oneshot::Sender<Result<()>>),
     Cmd(Box<dyn FnOnce(Pid) + Send>),
-    // CmdBatch,
 }
