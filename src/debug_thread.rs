@@ -23,9 +23,7 @@ pub struct ProcThread {
 
     interrupting: Arc<Mutex<bool>>,
     cmds: mpsc::Receiver<ProcCmd>,
-    // tokio here can likely can be replaced
-    // with future::mpsc
-    event_watch: tokio::sync::mpsc::Sender<Result<StopBatch>>,
+    event_watch: futures::channel::mpsc::Sender<Result<StopBatch>>,
 }
 
 pub struct StopBatch {
@@ -38,7 +36,7 @@ impl ProcThread {
         pid: Pid,
         interrupting: Arc<Mutex<bool>>,
         cmds: mpsc::Receiver<ProcCmd>,
-        event_watch: tokio::sync::mpsc::Sender<Result<StopBatch>>,
+        event_watch: futures::channel::mpsc::Sender<Result<StopBatch>>,
     ) -> Self {
         ProcThread {
             pid,

@@ -40,11 +40,11 @@ impl DebugHandle {
     ) -> Result<(
         DebugHandle,
         ProcThread,
-        tokio::sync::mpsc::Receiver<Result<StopBatch>>,
+        futures::channel::mpsc::Receiver<Result<StopBatch>>,
     )> {
         let (send, recv) = mpsc::channel();
         let interrupting = Arc::new(std::sync::Mutex::new(false));
-        let (event_send, event_recv) = tokio::sync::mpsc::channel(10);
+        let (event_send, event_recv) = futures::channel::mpsc::channel(10);
         let thread = ProcThread::new(pid, interrupting.clone(), recv, event_send);
 
         let handle = DebugHandle {

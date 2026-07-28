@@ -22,8 +22,8 @@ pub enum ChannelError {
     OneshotRecv { op: &'static str },
     #[error("oneshot send failed during {op}")]
     OneshotSend { op: &'static str },
-    #[error("tokio mpsc send failed during {op}")]
-    TokioMpscSend { op: &'static str },
+    #[error("async mpsc send failed during {op}")]
+    AsyncMpscSend { op: &'static str },
     #[error("std mpsc send failed during {op}")]
     StdMpscSend { op: &'static str },
 }
@@ -61,9 +61,9 @@ pub trait FromMpscSend<T> {
     fn with_err(self, op: &'static str) -> Result<T>;
 }
 
-impl<T, U> FromMpscSend<T> for std::result::Result<T, tokio::sync::mpsc::error::SendError<U>> {
+impl<T> FromMpscSend<T> for std::result::Result<T, futures::channel::mpsc::SendError> {
     fn with_err(self, op: &'static str) -> Result<T> {
-        self.map_err(|_| DebugError::Channel(ChannelError::TokioMpscSend { op }))
+        self.map_err(|_| DebugError::Channel(ChannelError::AsyncMpscSend { op }))
     }
 }
 

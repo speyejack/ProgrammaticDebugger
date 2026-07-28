@@ -2,10 +2,11 @@
 use std::num::NonZeroU64;
 use std::{num::NonZeroUsize, os::fd::AsFd, sync::Arc};
 
+use futures::SinkExt;
+use futures::channel::mpsc;
 #[cfg(feature = "mmap")]
 use nix::sys::mman::{MapFlags, ProtFlags};
 use nix::{libc::user_regs_struct, sys::wait::WaitPidFlag};
-use tokio::sync::mpsc;
 
 use crate::{
     DebugHandle, Result,
@@ -16,7 +17,7 @@ use crate::{
 
 pub struct DebugTask {
     pub(crate) id: TaskID,
-    pub(crate) sender: mpsc::Sender<DebuggerMessage>,
+    pub(crate) sender: futures::channel::mpsc::Sender<DebuggerMessage>,
     pub(crate) debug_handle: Arc<DebugHandle>,
 }
 
@@ -58,7 +59,7 @@ impl TaskBkPt {
     }
 
     pub async fn wait_break(&mut self) -> Option<user_regs_struct> {
-        self.recv.recv().await
+        self.recv.recv().await.ok()
     }
 }
 
@@ -71,7 +72,7 @@ impl Drop for TaskBkPt {
 }
 
 impl DebugTask {
-    pub async fn create_task(&self) -> Result<Self> {
+    pub async fn create_task(&mut self) -> Result<Self> {
         let (send, reply) = oneshot::channel();
         self.sender
             .send(DebuggerMessage::CreateNewTask(send))
@@ -86,11 +87,11 @@ impl DebugTask {
         })
     }
 
-    pub async fn req_shutdown(self) {
+    pub async fn req_shutdown(mut self) {
         let _ = self.sender.send(DebuggerMessage::GracefulShutdown).await;
     }
 
-    pub async fn complete(self) {
+    pub async fn complete(mut self) {
         let (send, reply) = oneshot::channel();
         let _ = self
             .sender
@@ -103,7 +104,7 @@ impl DebugTask {
         &self.debug_handle
     }
 
-    pub async fn cont(&self) -> Result<()> {
+    pub async fn cont(&mut self) -> Result<()> {
         let (send, reply) = oneshot::channel();
         self.sender
             .send(DebuggerMessage::Continue((self.id, send)))
@@ -112,7 +113,7 @@ impl DebugTask {
         Ok(reply.await.with_err("task continue")?)
     }
 
-    pub async fn step(&self) -> Result<()> {
+    pub async fn step(&mut self) -> Result<()> {
         let (send, reply) = oneshot::channel();
         self.sender
             .send(DebuggerMessage::Step((self.id, send)))
@@ -121,7 +122,7 @@ impl DebugTask {
         Ok(reply.await.with_err("task continue")?)
     }
 
-    pub async fn req_control(&self) -> Result<()> {
+    pub async fn req_control(&mut self) -> Result<()> {
         let (send, reply) = oneshot::channel();
         self.sender
             .send(DebuggerMessage::ReqControl((self.id, send)))
@@ -130,7 +131,7 @@ impl DebugTask {
         Ok(reply.await.with_err("task req control")?)
     }
 
-    pub async fn interrupt(&self) -> Result<()> {
+    pub async fn interrupt(&mut self) -> Result<()> {
         let (send, reply) = oneshot::channel();
         self.sender
             .send(DebuggerMessage::Interrupt((self.id, send)))
@@ -140,7 +141,7 @@ impl DebugTask {
         Ok(())
     }
 
-    pub async fn create_hw_bkpt(&self) -> Option<TaskBkPt> {
+    pub async fn create_hw_bkpt(&mut self) -> Option<TaskBkPt> {
         let (send, reply) = oneshot::channel();
         self.sender
             .send(DebuggerMessage::CreateHwBreakpoint((self.id, send)))
@@ -158,7 +159,10 @@ impl DebugTask {
         }
     }
 
-    pub async fn call_syscall(&self, mut sys_regs: user_regs_struct) -> Result<user_regs_struct> {
+    pub async fn call_syscall(
+        &mut self,
+        mut sys_regs: user_regs_struct,
+    ) -> Result<user_regs_struct> {
         self.req_control().await?;
 
         let orig_regs = self.handle().getregs().await?;
@@ -178,7 +182,7 @@ impl DebugTask {
         Ok(new_regs)
     }
 
-    pub async fn call_func(&self, mut func_regs: user_regs_struct) -> Result<user_regs_struct> {
+    pub async fn call_func(&mut self, mut func_regs: user_regs_struct) -> Result<user_regs_struct> {
         self.req_control().await?;
 
         let orig_regs = self.handle().getregs().await?;
@@ -200,7 +204,7 @@ impl DebugTask {
 
     #[cfg(feature = "mmap")]
     pub async fn call_mmap(
-        &self,
+        &mut self,
         addr: Option<NonZeroU64>,
         length: u64,
         prot: ProtFlags,

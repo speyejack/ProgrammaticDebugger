@@ -4,8 +4,8 @@ use std::{
     sync::Arc,
 };
 
+use futures::{SinkExt, channel::mpsc};
 use nix::{libc::user_regs_struct, sys::wait::WaitStatus, unistd::Pid};
-use tokio::sync::mpsc;
 
 use crate::{
     DebugHandle, DebugTask, Result,
@@ -40,6 +40,11 @@ enum TaskStatus {
     Waiting,
 }
 
+enum Event {
+    Ext(DebuggerMessage),
+    Tracee(Result<StopBatch>),
+}
+
 pub(crate) enum DebuggerMessage {
     // TaskWaiting(TaskID),
     // TODO: Need some way to delete tasks
@@ -68,7 +73,7 @@ pub(crate) enum DebuggerMessage {
 impl Debugger {
     pub async fn quick_setup(pid: Pid) -> Result<(Self, DebugTask, ProcThread)> {
         let (handle, thread, event_recv) = DebugHandle::setup_debugger(pid)?;
-        let (send, recv) = mpsc::channel(10);
+        let (send, recv) = futures::channel::mpsc::channel(10);
         let handle = Arc::new(handle);
 
         let task = DebugTask {
@@ -99,9 +104,10 @@ impl Debugger {
 
     pub async fn event_loop(mut self) {
         loop {
-            tokio::select! {
+            futures::select! {
+
                 event = self.event_recv.recv() => {
-                    if let Some(Ok(batch)) = event {
+                    if let Ok(Ok(batch)) = event {
                         tracing::debug!("Debugger got stop batch from proc thread");
 
                         let e = self.handle_stopping(batch).await;
@@ -115,7 +121,7 @@ impl Debugger {
                 event = self.recv.recv() => {
                     tracing::debug!("Debugger got event from tasks");
                     match event {
-                        Some(event) => {
+                        Ok(event) => {
                             let o = self.handle_ext_event(event).await;
 
                             match o {
@@ -127,13 +133,13 @@ impl Debugger {
                             }
 
                         },
-                        None => {
+                        Err(_) => {
                             tracing::info!("Shutting down debugger");
                             break
                         },
                     }
                 }
-            };
+            }
         }
     }
 
@@ -187,8 +193,9 @@ impl Debugger {
                 let idx = d6.trailing_zeros() as usize;
                 tracing::debug!("Hw breakpoint {} being triggered", idx);
                 let (task_id, _hw_bk, sender) = self.hw_bps[idx]
-                    .as_ref()
+                    .as_mut()
                     .expect("Hw breakpoint accessed without being setup");
+
                 if let Some(task_status) = self.tstatus.get_mut(task_id) {
                     *task_status = TaskStatus::Running;
                     sender
