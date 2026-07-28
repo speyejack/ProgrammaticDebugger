@@ -217,7 +217,7 @@ impl Debugger {
         }
         tracing::debug!("Handled steps");
 
-        self.attempt_resume().await;
+        self.attempt_resume().await?;
         Ok(())
     }
 
