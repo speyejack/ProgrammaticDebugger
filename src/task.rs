@@ -104,13 +104,22 @@ impl DebugTask {
         Ok(reply.await.with_err("task continue")?)
     }
 
+    pub async fn req_control(&self) -> Result<()> {
+        let (send, reply) = oneshot::channel();
+        self.sender
+            .send(DebuggerMessage::ReqControl((self.id, send)))
+            .await
+            .with_err("task req control")?;
+        Ok(reply.await.with_err("task req control")?)
+    }
+
     pub async fn interrupt(&self) -> Result<()> {
         let (send, reply) = oneshot::channel();
         self.sender
             .send(DebuggerMessage::Interrupt((self.id, send)))
             .await
             .with_err("task interrupt")?;
-        reply.await.with_err("task interrupt")?;
+        reply.await.with_err("task interrupt")??;
         Ok(())
     }
 

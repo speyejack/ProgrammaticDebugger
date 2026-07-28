@@ -1,4 +1,8 @@
-use std::{collections::HashMap, mem::offset_of, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    mem::offset_of,
+    sync::Arc,
+};
 
 use nix::{
     libc::user_regs_struct,
@@ -30,6 +34,7 @@ pub struct Debugger {
     on_interrupt: Vec<(TaskID, oneshot::Sender<Result<()>>)>,
     on_step: Vec<(TaskID, oneshot::Sender<()>)>,
     on_continue: Vec<(TaskID, oneshot::Sender<()>)>,
+    req_control: VecDeque<(TaskID, oneshot::Sender<()>)>,
 
     hw_bps: [Option<(TaskID, HardwareBreakpoint, mpsc::Sender<user_regs_struct>)>; 4],
 }
@@ -42,12 +47,14 @@ enum TaskStatus {
 
 pub(crate) enum DebuggerMessage {
     // TaskWaiting(TaskID),
+    // TODO: Need some way to delete tasks
     CreateNewTask(oneshot::Sender<TaskID>),
 
     Continue((TaskID, oneshot::Sender<()>)),
     Step((TaskID, oneshot::Sender<()>)),
 
     Interrupt((TaskID, oneshot::Sender<Result<()>>)),
+    ReqControl((TaskID, oneshot::Sender<()>)),
     // CreateBreakpoint,
     // DeleteBreakpoint(oneshot::Sender<()>),
     //
@@ -85,6 +92,7 @@ impl Debugger {
                 on_interrupt: Default::default(),
                 on_step: Default::default(),
                 on_continue: Default::default(),
+                req_control: Default::default(),
                 hw_bps: [const { None }; 4],
             },
             task,
@@ -255,6 +263,11 @@ impl Debugger {
 
                 return Ok(());
             }
+            DebuggerMessage::ReqControl((id, sender)) => {
+                tracing::debug!("Task {id} requested control from debugger");
+                self.req_control.push_back((id, sender));
+                self.tstatus.insert(id, TaskStatus::Waiting);
+            }
             DebuggerMessage::CreateHwBreakpoint((task_id, sender)) => {
                 tracing::debug!("Debugger got {task_id} created hw breakpoint");
                 let idx = self.hw_bps.iter().position(|v| v.is_none());
@@ -320,12 +333,14 @@ impl Debugger {
             return Ok(());
         }
 
+        // Handle any pending interrupts
         if !self.on_interrupt.is_empty() {
             self.send_interrupts().await;
             tracing::debug!("Handled interrupts");
             return Ok(());
         }
 
+        // Prevent resuming if any tasks not waiting
         if self
             .tstatus
             .iter()
@@ -335,20 +350,36 @@ impl Debugger {
             return Ok(());
         }
 
-        // TODO: Handle errors about continuing properly here rather than ignore
+        // Handle any special control requests one at a time
+        if !self.req_control.is_empty() {
+            let (id, sender) = self.req_control.pop_front().unwrap();
+
+            match sender.send(()) {
+                Ok(_) => {
+                    self.tstatus.insert(id, TaskStatus::Running);
+                }
+                Err(_) => {
+                    self.tstatus.remove(&id);
+                }
+            }
+            self.tstatus.insert(id, TaskStatus::Running);
+            return Ok(());
+        }
+
+        // Handle any step requests
         if !self.on_step.is_empty() {
             self.is_stepping = true;
-            let _ = self.handle.step(None);
             self.handle.step(None).await?;
+            // Step requests handled after step
             self.is_stopped = false;
             tracing::debug!("Resuming step");
             return Ok(());
         }
 
         tracing::debug!("Resuming cont");
-        let _ = self.handle.cont(None);
-        self.send_continues().await;
+        // Handle any step requests
         self.handle.cont(None).await?;
+        self.send_continues().await;
         self.is_stopped = false;
         Ok(())
     }
@@ -356,25 +387,40 @@ impl Debugger {
     async fn send_interrupts(&mut self) {
         let on_interrupt = std::mem::replace(&mut self.on_interrupt, Vec::new());
         for (id, sender) in on_interrupt {
-            self.tstatus.insert(id, TaskStatus::Running);
-            let _ = sender.send(Ok(()));
+            match sender.send(Ok(())) {
+                Ok(_) => {
+                    self.tstatus.insert(id, TaskStatus::Running);
+                }
+                Err(_) => {
+                    self.tstatus.remove(&id);
+                }
+            }
         }
     }
 
     async fn send_continues(&mut self) {
         let on_continue = std::mem::replace(&mut self.on_continue, Vec::new());
-        for (_id, sender) in on_continue {
+        for (id, sender) in on_continue {
             // May need to want to track this
             // self.tstatus.insert(id, TaskStatus::Running);
-            let _ = sender.send(());
+            let o = sender.send(());
+            if let Err(e) = o {
+                self.tstatus.remove(&id);
+            }
         }
     }
 
     async fn send_steps(&mut self) {
         let on_step = std::mem::replace(&mut self.on_step, Vec::new());
         for (id, sender) in on_step {
-            self.tstatus.insert(id, TaskStatus::Running);
-            let _ = sender.send(());
+            match sender.send(()) {
+                Ok(_) => {
+                    self.tstatus.insert(id, TaskStatus::Running);
+                }
+                Err(_) => {
+                    self.tstatus.remove(&id);
+                }
+            }
         }
     }
 }
