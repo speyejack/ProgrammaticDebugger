@@ -1,5 +1,4 @@
-use nix::{errno::Errno, sys::ptrace, unistd::Pid};
-use oneshot::{RecvError, SendError};
+use nix::{errno::Errno, unistd::Pid};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, DebugError>;

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::{
     ffi::c_long,
     sync::{Arc, Mutex, mpsc},
@@ -7,47 +6,42 @@ use std::{
 use nix::{
     errno::Errno,
     libc::{ptrace_syscall_info, siginfo_t, user_regs_struct},
-    poll::PollTimeout,
     sys::{
-        eventfd::{EfdFlags, EventFd},
         ptrace::{self, AddressType, RegisterSet},
         signal::Signal,
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
     unistd::Pid,
 };
-use oneshot::AsyncReceiver;
 
 use crate::{
     Result,
-    comms::ProcCmd,
-    debug_thread::{INTERRUPT_SIGNAL, ProcThread, StopBatch},
-    err::{
-        DebugError, FromMpscSend, FromOneshotRecv, FromOneshotSend, FromPtraceExt, FromStdMpscSend,
-    },
+    comms::PtraceRequest,
+    debug_thread::{INTERRUPT_SIGNAL, PtraceThread, StopBatch},
+    err::{FromOneshotRecv, FromPtraceExt, FromStdMpscSend},
 };
 
 #[derive(Debug, Clone)]
-pub struct DebugHandle {
+pub struct TraceeHandle {
     pub interrupting: Arc<Mutex<bool>>,
     pub sig_pid: Pid,
-    pub cmds: mpsc::Sender<ProcCmd>,
+    pub cmds: mpsc::Sender<PtraceRequest>,
 }
 
-impl DebugHandle {
+impl TraceeHandle {
     pub fn setup_debugger(
         pid: Pid,
     ) -> Result<(
-        DebugHandle,
-        ProcThread,
+        TraceeHandle,
+        PtraceThread,
         futures::channel::mpsc::Receiver<Result<StopBatch>>,
     )> {
         let (send, recv) = mpsc::channel();
         let interrupting = Arc::new(std::sync::Mutex::new(false));
         let (event_send, event_recv) = futures::channel::mpsc::channel(10);
-        let thread = ProcThread::new(pid, interrupting.clone(), recv, event_send);
+        let thread = PtraceThread::new(pid, interrupting.clone(), recv, event_send);
 
-        let handle = DebugHandle {
+        let handle = TraceeHandle {
             interrupting,
             sig_pid: pid,
             cmds: send,
@@ -75,7 +69,7 @@ impl DebugHandle {
     pub async fn attach(&self) -> Result<()> {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(ProcCmd::Attach(send))
+            .send(PtraceRequest::Attach(send))
             .with_err("handle attach cmd")?;
 
         recv.await.with_err("handle attach cmd")?
@@ -84,7 +78,7 @@ impl DebugHandle {
     pub async fn seize(&self, options: ptrace::Options) -> Result<()> {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(ProcCmd::Seize(options, send))
+            .send(PtraceRequest::Seize(options, send))
             .with_err("handle seize cmd")?;
 
         recv.await.with_err("handle seize cmd")?
@@ -96,7 +90,7 @@ impl DebugHandle {
     {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(ProcCmd::Continue(sig.into(), send))
+            .send(PtraceRequest::Continue(sig.into(), send))
             .with_err("handle continue cmd")?;
 
         recv.await.with_err("handle continue cmd")?
@@ -108,7 +102,7 @@ impl DebugHandle {
     {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(ProcCmd::Step(sig.into(), send))
+            .send(PtraceRequest::Step(sig.into(), send))
             .with_err("handle step cmd")?;
 
         recv.await.with_err("handle step cmd")?
@@ -290,7 +284,7 @@ impl DebugHandle {
         };
 
         self.cmds
-            .send(ProcCmd::Cmd(Box::new(wrapper)))
+            .send(PtraceRequest::Cmd(Box::new(wrapper)))
             .with_err("handle cmd")?;
 
         let data = recv.await.with_err("handle cmd")?;

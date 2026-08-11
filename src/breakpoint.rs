@@ -20,7 +20,7 @@ impl HardwareBreakpoint {
         }
     }
 
-    pub fn is_enable(&self, is_enabled: bool) -> HardwareBreakpoint {
+    pub fn set_enable(&self, is_enabled: bool) -> HardwareBreakpoint {
         HardwareBreakpoint {
             is_enabled,
             ..*self
@@ -42,36 +42,38 @@ impl HardwareBreakpoint {
         HardwareBreakpoint { condition, ..*self }
     }
 
-    pub fn dx_addr(&self) -> usize {
+    pub(crate) fn dx_addr(&self) -> usize {
         let debug_offset = offset_of!(nix::libc::user, u_debugreg);
 
         debug_offset + self.id * 8
     }
 
-    pub fn d6_addr() -> usize {
+    pub(crate) fn d6_addr() -> usize {
         let debug_offset = offset_of!(nix::libc::user, u_debugreg);
         let d6o = debug_offset + 6 * 8;
 
         d6o
     }
-    pub fn d7_addr() -> usize {
+
+    pub(crate) fn d7_addr() -> usize {
         let debug_offset = offset_of!(nix::libc::user, u_debugreg);
         let d7o = debug_offset + 7 * 8;
 
         d7o
     }
 
-    pub fn d7_set(&self) -> i64 {
+    pub(crate) fn d7_set(&self) -> i64 {
         0b01 << (self.id * 2)  // Enable
             | 0b1 << (16 + self.id) // recommended to have this local exact breakpoint
             | self.condition.to_binary() << (16 + self.id * 2)
             | self.size.to_binary() << (18 + self.id * 2)
     }
-    pub fn d7_mask(&self) -> i64 {
+
+    pub(crate) fn d7_mask(&self) -> i64 {
         Self::d7_mask_for_id(self.id)
     }
 
-    pub fn d7_mask_for_id(id: usize) -> i64 {
+    pub(crate) fn d7_mask_for_id(id: usize) -> i64 {
         0b11 << (id * 2)  // Enable
             | 0b1 << (16 + id) // recommended to have this local exact breakpoint
             | 0b11 << (16 + id * 2)

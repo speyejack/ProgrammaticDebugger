@@ -53,7 +53,7 @@ fn main() -> Result<()> {
                 let mut hw_bk = task.create_hw_bkpt().await.unwrap();
                 hw_bk
                     .modify(|bk| {
-                        bk.is_enable(true)
+                        bk.set_enable(true)
                             .location(addr)
                             .condition(async_debugger::HwBreakpointCond::Write)
                             .size(async_debugger::HwBreakpointSize::Bytes4)

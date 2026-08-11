@@ -1,9 +1,6 @@
-use std::{
-    os::fd::AsFd,
-    sync::{Arc, Mutex, mpsc},
-};
+use std::sync::{Arc, Mutex, mpsc};
 
-use crate::{Result, comms::ProcCmd, err::FromPtraceExt};
+use crate::{Result, comms::PtraceRequest, err::FromPtraceExt};
 
 use nix::{
     libc::siginfo_t,
@@ -17,12 +14,12 @@ use nix::{
 
 pub const INTERRUPT_SIGNAL: Signal = Signal::SIGUSR1;
 
-pub struct ProcThread {
+pub struct PtraceThread {
     pid: Pid,
     tracee_running: bool,
 
     interrupting: Arc<Mutex<bool>>,
-    cmds: mpsc::Receiver<ProcCmd>,
+    cmds: mpsc::Receiver<PtraceRequest>,
     event_watch: futures::channel::mpsc::Sender<Result<StopBatch>>,
 }
 
@@ -31,14 +28,14 @@ pub struct StopBatch {
     pub was_interrupt: bool,
 }
 
-impl ProcThread {
+impl PtraceThread {
     pub fn new(
         pid: Pid,
         interrupting: Arc<Mutex<bool>>,
-        cmds: mpsc::Receiver<ProcCmd>,
+        cmds: mpsc::Receiver<PtraceRequest>,
         event_watch: futures::channel::mpsc::Sender<Result<StopBatch>>,
     ) -> Self {
-        ProcThread {
+        PtraceThread {
             pid,
             tracee_running: false,
             interrupting,
@@ -48,13 +45,13 @@ impl ProcThread {
     }
 
     pub fn event_loop(mut self) -> Result<()> {
-        use ProcCmd::*;
+        use PtraceRequest::*;
         'event_loop: loop {
             if self.tracee_running {
-                tracing::debug!("ProcThread waiting for tracee stop");
+                tracing::debug!("PtraceThread waiting for tracee stop");
                 let batch = self.wait_stop();
                 if let Err(e) = self.event_watch.try_send(batch) {
-                    tracing::debug!("ProcThread closing due to event watch: {e}");
+                    tracing::debug!("PtraceThread closing due to event watch: {e}");
                     break;
                 }
 
@@ -93,7 +90,7 @@ impl ProcThread {
             self.tracee_running = true;
         }
 
-        tracing::info!("Proc Thread terminating");
+        tracing::info!("Ptrace Thread terminating");
         Ok(())
     }
 

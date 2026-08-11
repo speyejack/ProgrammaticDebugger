@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, VecDeque},
-    mem::offset_of,
     sync::Arc,
 };
 
@@ -8,16 +7,16 @@ use futures::{SinkExt, channel::mpsc};
 use nix::{libc::user_regs_struct, sys::wait::WaitStatus, unistd::Pid};
 
 use crate::{
-    DebugHandle, DebugTask, Result,
+    Result, Task, TraceeHandle,
     breakpoint::HardwareBreakpoint,
-    debug_thread::{ProcThread, StopBatch},
     err::{FromMpscSend, FromOneshotSend},
+    ptrace_thread::{PtraceThread, StopBatch},
 };
 
 pub type TaskID = usize;
 
 pub struct Debugger {
-    handle: Arc<DebugHandle>,
+    handle: Arc<TraceeHandle>,
     recv: mpsc::Receiver<DebuggerMessage>,
     event_recv: mpsc::Receiver<Result<StopBatch>>,
 
@@ -71,12 +70,12 @@ pub(crate) enum DebuggerMessage {
 }
 
 impl Debugger {
-    pub async fn quick_setup(pid: Pid) -> Result<(Self, DebugTask, ProcThread)> {
-        let (handle, thread, event_recv) = DebugHandle::setup_debugger(pid)?;
+    pub async fn quick_setup(pid: Pid) -> Result<(Self, Task, PtraceThread)> {
+        let (handle, thread, event_recv) = TraceeHandle::setup_debugger(pid)?;
         let (send, recv) = futures::channel::mpsc::channel(10);
         let handle = Arc::new(handle);
 
-        let task = DebugTask {
+        let task = Task {
             id: 0,
             debug_handle: handle.clone(),
             sender: send.clone(),
@@ -145,8 +144,7 @@ impl Debugger {
 
     // This function needs to be refactored to handle each event better, likely queuing them up
     async fn handle_stopping(&mut self, batch: StopBatch) -> Result<()> {
-        let debug_offset = offset_of!(nix::libc::user, u_debugreg);
-        let d6o = debug_offset + 6 * 8;
+        let d6o = HardwareBreakpoint::d6_addr();
 
         let mut stepped = false;
         let mut hw_d6 = None;
