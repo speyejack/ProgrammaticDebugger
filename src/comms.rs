@@ -1,14 +1,20 @@
 use nix::{
-    sys::{ptrace, signal::Signal},
+    libc::siginfo_t,
+    sys::{ptrace, signal::Signal, wait::WaitStatus},
     unistd::Pid,
 };
 
 use crate::Result;
 
 pub enum PtraceRequest {
-    Attach(oneshot::Sender<Result<()>>),
-    Seize(ptrace::Options, oneshot::Sender<Result<()>>),
-    Continue(Option<Signal>, oneshot::Sender<Result<()>>),
-    Step(Option<Signal>, oneshot::Sender<Result<()>>),
-    Cmd(Box<dyn FnOnce(Pid) + Send>),
+    Attach(Pid, oneshot::Sender<Result<()>>),
+    Seize(Pid, ptrace::Options, oneshot::Sender<Result<()>>),
+    Continue(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
+    Step(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
+    Cmd(Box<dyn FnOnce() + Send>),
+}
+
+pub struct StopBatch {
+    pub events: Vec<(WaitStatus, Option<siginfo_t>)>,
+    pub was_interrupt: bool,
 }

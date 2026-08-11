@@ -16,15 +16,15 @@ use nix::{
 
 use crate::{
     Result,
-    comms::PtraceRequest,
-    debug_thread::{INTERRUPT_SIGNAL, PtraceThread, StopBatch},
+    comms::{PtraceRequest, StopBatch},
     err::{FromOneshotRecv, FromPtraceExt, FromStdMpscSend},
+    ptrace_thread::{INTERRUPT_SIGNAL, PtraceThread},
 };
 
 #[derive(Debug, Clone)]
 pub struct TraceeHandle {
     pub interrupting: Arc<Mutex<bool>>,
-    pub sig_pid: Pid,
+    pub tracee_pid: Pid,
     pub cmds: mpsc::Sender<PtraceRequest>,
 }
 
@@ -39,11 +39,11 @@ impl TraceeHandle {
         let (send, recv) = mpsc::channel();
         let interrupting = Arc::new(std::sync::Mutex::new(false));
         let (event_send, event_recv) = futures::channel::mpsc::channel(10);
-        let thread = PtraceThread::new(pid, interrupting.clone(), recv, event_send);
+        let thread = PtraceThread::new(interrupting.clone(), recv, event_send);
 
         let handle = TraceeHandle {
             interrupting,
-            sig_pid: pid,
+            tracee_pid: pid,
             cmds: send,
         };
 
@@ -57,8 +57,8 @@ impl TraceeHandle {
             *is_interrupting = true;
             drop(is_interrupting);
             tracing::debug!("Handle sending interrupt signal");
-            nix::sys::signal::kill(self.sig_pid, INTERRUPT_SIGNAL)
-                .with_err("handle interrupting process", self.sig_pid)?;
+            nix::sys::signal::kill(self.tracee_pid, INTERRUPT_SIGNAL)
+                .with_err("handle interrupting process", Some(self.tracee_pid))?;
         }
         // let _ = self.alert_fd.write(1);
         Ok(())
@@ -69,7 +69,7 @@ impl TraceeHandle {
     pub async fn attach(&self) -> Result<()> {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(PtraceRequest::Attach(send))
+            .send(PtraceRequest::Attach(self.tracee_pid, send))
             .with_err("handle attach cmd")?;
 
         recv.await.with_err("handle attach cmd")?
@@ -78,7 +78,7 @@ impl TraceeHandle {
     pub async fn seize(&self, options: ptrace::Options) -> Result<()> {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(PtraceRequest::Seize(options, send))
+            .send(PtraceRequest::Seize(self.tracee_pid, options, send))
             .with_err("handle seize cmd")?;
 
         recv.await.with_err("handle seize cmd")?
@@ -90,7 +90,7 @@ impl TraceeHandle {
     {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(PtraceRequest::Continue(sig.into(), send))
+            .send(PtraceRequest::Continue(self.tracee_pid, sig.into(), send))
             .with_err("handle continue cmd")?;
 
         recv.await.with_err("handle continue cmd")?
@@ -102,7 +102,7 @@ impl TraceeHandle {
     {
         let (send, recv) = oneshot::async_channel();
         self.cmds
-            .send(PtraceRequest::Step(sig.into(), send))
+            .send(PtraceRequest::Step(self.tracee_pid, sig.into(), send))
             .with_err("handle step cmd")?;
 
         recv.await.with_err("handle step cmd")?
@@ -278,7 +278,8 @@ impl TraceeHandle {
     {
         let (send, recv) = oneshot::async_channel();
 
-        let wrapper = move |pid| {
+        let pid = self.tracee_pid;
+        let wrapper = move || {
             let res = func(pid).with_err(op, pid);
             let _ = send.send(res);
         };

@@ -28,12 +28,16 @@ pub enum ChannelError {
 }
 
 pub trait FromPtraceExt<T> {
-    fn with_err(self, op: &'static str, pid: Pid) -> Result<T>;
+    fn with_err<P: Into<Option<Pid>>>(self, op: &'static str, pid: P) -> Result<T>;
 }
 
 impl<T> FromPtraceExt<T> for std::result::Result<T, Errno> {
-    fn with_err(self, op: &'static str, pid: Pid) -> Result<T> {
-        self.map_err(|code| DebugError::Ptrace { op, pid, code })
+    fn with_err<P: Into<Option<Pid>>>(self, op: &'static str, pid: P) -> Result<T> {
+        self.map_err(|code| DebugError::Ptrace {
+            op,
+            pid: pid.into().unwrap_or(Pid::from_raw(0)),
+            code,
+        })
     }
 }
 pub trait FromOneshotSend<T> {

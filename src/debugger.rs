@@ -9,8 +9,9 @@ use nix::{libc::user_regs_struct, sys::wait::WaitStatus, unistd::Pid};
 use crate::{
     Result, Task, TraceeHandle,
     breakpoint::HardwareBreakpoint,
+    comms::StopBatch,
     err::{FromMpscSend, FromOneshotSend},
-    ptrace_thread::{PtraceThread, StopBatch},
+    ptrace_thread::PtraceThread,
 };
 
 pub type TaskID = usize;
@@ -39,14 +40,7 @@ enum TaskStatus {
     Waiting,
 }
 
-enum Event {
-    Ext(DebuggerMessage),
-    Tracee(Result<StopBatch>),
-}
-
 pub(crate) enum DebuggerMessage {
-    // TaskWaiting(TaskID),
-    // TODO: Need some way to delete tasks
     CreateNewTask(oneshot::Sender<TaskID>),
     RemoveTask((TaskID, oneshot::Sender<()>)),
 
@@ -357,7 +351,7 @@ impl Debugger {
                 }
 
                 for maybe_hwbp in self.hw_bps.iter_mut() {
-                    if let Some((task_id, bp, sender)) = maybe_hwbp.take() {
+                    if let Some((_task_id, bp, _sender)) = maybe_hwbp.take() {
                         let _ = self.handle.write_user(bp.dx_addr(), 0).await;
                     }
                 }
@@ -452,7 +446,7 @@ impl Debugger {
             // May need to want to track this
             // self.tstatus.insert(id, TaskStatus::Running);
             let o = sender.send(());
-            if let Err(e) = o {
+            if let Err(_) = o {
                 self.tstatus.remove(&id);
             }
         }

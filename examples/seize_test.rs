@@ -67,7 +67,7 @@ fn main() -> Result<()> {
                     let regs = hw_bk.wait_break().await.unwrap();
                     *found.lock().await.entry(regs.rip).or_insert(0) += 1;
                     let res = task.cont().await;
-                    if let Err(e) = res {
+                    if let Err(_) = res {
                         break;
                     }
                 }
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
             println!("Lock: {:x?}", *lock);
             drop(lock);
 
-            for i in 0..10 {
+            for _i in 0..10 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let lock = found_map.lock().await;
                 println!("Lock: {:x?}", *lock);
