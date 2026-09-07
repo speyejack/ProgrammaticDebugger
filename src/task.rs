@@ -15,6 +15,7 @@ use crate::{
     err::{FromMpscSend, FromOneshotRecv},
 };
 
+#[derive(Debug)]
 pub struct Task {
     pub(crate) id: TaskID,
     pub(crate) sender: futures::channel::mpsc::Sender<DebuggerMessage>,
@@ -22,19 +23,15 @@ pub struct Task {
 }
 
 impl Task {
-    pub async fn create_task(&mut self) -> Result<Self> {
-        let (send, reply) = oneshot::channel();
-        self.sender
-            .send(DebuggerMessage::CreateNewTask(send))
-            .await
-            .with_err("task creation")?;
-        let id = reply.await.with_err("task creation")?;
-
-        Ok(Task {
-            id,
+    pub fn spawner(&self) -> Spawner {
+        Spawner {
             sender: self.sender.clone(),
             debug_handle: self.debug_handle.clone(),
-        })
+        }
+    }
+
+    pub async fn fork(&mut self) -> Result<Self> {
+        self.spawner().task().await
     }
 
     pub async fn req_shutdown(mut self) {
@@ -176,6 +173,34 @@ impl Task {
         let out = self.call_syscall(regs).await?;
 
         Ok(out.rax)
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        let _ = self.sender.try_send(DebuggerMessage::TaskDropped(self.id));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Spawner {
+    pub(crate) sender: futures::channel::mpsc::Sender<DebuggerMessage>,
+    pub(crate) debug_handle: Arc<TraceeHandle>,
+}
+impl Spawner {
+    pub async fn task(&mut self) -> Result<Task> {
+        let (send, reply) = oneshot::channel();
+        self.sender
+            .send(DebuggerMessage::CreateNewTask(send))
+            .await
+            .with_err("task creation")?;
+        let id = reply.await.with_err("task creation")?;
+
+        Ok(Task {
+            id,
+            sender: self.sender.clone(),
+            debug_handle: self.debug_handle.clone(),
+        })
     }
 }
 

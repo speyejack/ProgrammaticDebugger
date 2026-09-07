@@ -25,8 +25,10 @@ fn main() -> Result<()> {
             let found = found_map.clone();
 
             println!("Quick setup happening");
-            let (debugger, mut task, thread) = async_debugger::Debugger::quick_setup(pid).await?;
+            let (debugger, mut spawner, thread) =
+                async_debugger::Debugger::quick_setup(pid).await?;
             println!("Performed quick_setup");
+            let mut task = spawner.task().await.unwrap();
 
             std::thread::spawn(move || {
                 let out = thread.event_loop();
@@ -46,7 +48,7 @@ fn main() -> Result<()> {
             task.interrupt().await.unwrap();
             println!("Tracee interrupted");
 
-            let mut mmap_task = task.create_task().await?;
+            let mut mmap_task = task.fork().await?;
 
             tokio::spawn(async move {
                 println!("creating breakpoint");

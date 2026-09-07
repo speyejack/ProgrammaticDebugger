@@ -1,10 +1,10 @@
 use nix::{errno::Errno, unistd::Pid};
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, DebugError>;
+pub type Result<T> = std::result::Result<T, DebuggerError>;
 
-#[derive(Error, Debug)]
-pub enum DebugError {
+#[derive(Error, Debug, Clone)]
+pub enum DebuggerError {
     #[error("ptrace {op} failed using pid {pid}: {code}")]
     Ptrace {
         op: &'static str,
@@ -33,7 +33,7 @@ pub trait FromPtraceExt<T> {
 
 impl<T> FromPtraceExt<T> for std::result::Result<T, Errno> {
     fn with_err<P: Into<Option<Pid>>>(self, op: &'static str, pid: P) -> Result<T> {
-        self.map_err(|code| DebugError::Ptrace {
+        self.map_err(|code| DebuggerError::Ptrace {
             op,
             pid: pid.into().unwrap_or(Pid::from_raw(0)),
             code,
@@ -46,7 +46,7 @@ pub trait FromOneshotSend<T> {
 
 impl<T> FromOneshotRecv<T> for std::result::Result<T, oneshot::RecvError> {
     fn with_err(self, op: &'static str) -> Result<T> {
-        self.map_err(|_| DebugError::Channel(ChannelError::OneshotSend { op }))
+        self.map_err(|_| DebuggerError::Channel(ChannelError::OneshotSend { op }))
     }
 }
 
@@ -56,7 +56,7 @@ pub trait FromOneshotRecv<T> {
 
 impl<T, U> FromOneshotSend<T> for std::result::Result<T, oneshot::SendError<U>> {
     fn with_err(self, op: &'static str) -> Result<T> {
-        self.map_err(|_| DebugError::Channel(ChannelError::OneshotSend { op }))
+        self.map_err(|_| DebuggerError::Channel(ChannelError::OneshotSend { op }))
     }
 }
 
@@ -66,7 +66,7 @@ pub trait FromMpscSend<T> {
 
 impl<T> FromMpscSend<T> for std::result::Result<T, futures::channel::mpsc::SendError> {
     fn with_err(self, op: &'static str) -> Result<T> {
-        self.map_err(|_| DebugError::Channel(ChannelError::AsyncMpscSend { op }))
+        self.map_err(|_| DebuggerError::Channel(ChannelError::AsyncMpscSend { op }))
     }
 }
 
@@ -76,6 +76,6 @@ pub trait FromStdMpscSend<T> {
 
 impl<T, U> FromStdMpscSend<T> for std::result::Result<T, std::sync::mpsc::SendError<U>> {
     fn with_err(self, op: &'static str) -> Result<T> {
-        self.map_err(|_| DebugError::Channel(ChannelError::StdMpscSend { op }))
+        self.map_err(|_| DebuggerError::Channel(ChannelError::StdMpscSend { op }))
     }
 }

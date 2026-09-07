@@ -7,7 +7,7 @@ use futures::{SinkExt, channel::mpsc};
 use nix::{libc::user_regs_struct, sys::wait::WaitStatus, unistd::Pid};
 
 use crate::{
-    Result, Task, TraceeHandle,
+    Result, Spawner, TraceeHandle,
     breakpoint::HardwareBreakpoint,
     comms::StopBatch,
     err::{FromMpscSend, FromOneshotSend},
@@ -43,6 +43,7 @@ enum TaskStatus {
 pub(crate) enum DebuggerMessage {
     CreateNewTask(oneshot::Sender<TaskID>),
     RemoveTask((TaskID, oneshot::Sender<()>)),
+    TaskDropped(TaskID),
 
     Continue((TaskID, oneshot::Sender<()>)),
     Step((TaskID, oneshot::Sender<()>)),
@@ -64,13 +65,12 @@ pub(crate) enum DebuggerMessage {
 }
 
 impl Debugger {
-    pub async fn quick_setup(pid: Pid) -> Result<(Self, Task, PtraceThread)> {
+    pub async fn quick_setup(pid: Pid) -> Result<(Self, Spawner, PtraceThread)> {
         let (handle, thread, event_recv) = TraceeHandle::setup_debugger(pid)?;
         let (send, recv) = futures::channel::mpsc::channel(10);
         let handle = Arc::new(handle);
 
-        let task = Task {
-            id: 0,
+        let spawner = Spawner {
             debug_handle: handle.clone(),
             sender: send.clone(),
         };
@@ -81,7 +81,7 @@ impl Debugger {
                 recv,
                 event_recv,
                 tstatus: Default::default(),
-                next_id: 1,
+                next_id: 0,
                 is_stopped: false,
                 is_stepping: false,
                 on_interrupt: Default::default(),
@@ -90,7 +90,7 @@ impl Debugger {
                 req_control: Default::default(),
                 hw_bps: [const { None }; 4],
             },
-            task,
+            spawner,
             thread,
         ))
     }
@@ -257,6 +257,11 @@ impl Debugger {
 
                 self.tstatus.remove(&id);
                 let _ = sender.send(());
+            }
+            DebuggerMessage::TaskDropped(id) => {
+                tracing::debug!("Debugger removing task");
+
+                self.tstatus.remove(&id);
             }
             DebuggerMessage::Continue((id, sender)) => {
                 tracing::debug!("Debugger got {id} wants continue");
