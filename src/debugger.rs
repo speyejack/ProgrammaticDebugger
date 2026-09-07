@@ -183,21 +183,23 @@ impl Debugger {
             let regs = self.handle.getregs().await?;
             while d6 > 0 {
                 let idx = d6.trailing_zeros() as usize;
-                tracing::debug!("Hw breakpoint {} being triggered", idx);
-                let (task_id, _hw_bk, sender) = self.hw_bps[idx]
-                    .as_mut()
-                    .expect("Hw breakpoint accessed without being setup");
-
-                if let Some(task_status) = self.tstatus.get_mut(task_id) {
-                    *task_status = TaskStatus::Running;
-                    sender
-                        .send(regs)
-                        .await
-                        .with_err("debugger resuming task on hw bp")?;
+                tracing::trace!("Hw breakpoint {} being triggered", idx);
+                tracing::trace!("Breakpoints: {:?}", self.hw_bps);
+                if let Some((task_id, _hw_bk, sender)) = self.hw_bps[idx].as_mut() {
+                    if let Some(task_status) = self.tstatus.get_mut(task_id) {
+                        *task_status = TaskStatus::Running;
+                        sender
+                            .send(regs)
+                            .await
+                            .with_err("debugger resuming task on hw bp")?;
+                    } else {
+                        // TODO: Reset & disable hw breakpoint. Replace with None in list
+                        todo!("Handle unlinked breakpoint")
+                    }
                 } else {
-                    // TODO: Reset & disable hw breakpoint. Replace with None in list
-                    todo!("Handle unlinked breakpoint")
+                    tracing::debug!("Hw breakpoint accessed without being setup");
                 }
+
                 d6 >>= 1;
             }
             self.handle.write_user(d6o, 0x0).await?;
