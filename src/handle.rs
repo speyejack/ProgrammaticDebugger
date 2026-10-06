@@ -159,9 +159,12 @@ impl TraceeHandle {
             .await
     }
 
-    pub async fn getsiginfo(&self) -> Result<siginfo_t> {
-        self.send_cmd(move |pid| ptrace::getsiginfo(pid), "getsiginfo")
-            .await
+    pub async fn getsiginfo(&self) -> Result<SigInfo> {
+        self.send_cmd(
+            move |pid| ptrace::getsiginfo(pid).map(|x| SigInfo::from(x)),
+            "getsiginfo",
+        )
+        .await
     }
 
     pub async fn raw_interrupt(&self) -> Result<()> {
@@ -207,11 +210,6 @@ impl TraceeHandle {
         <S as RegisterSet>::Regs: Send + 'static,
     {
         self.send_cmd(move |pid| ptrace::setregset::<S>(pid, regs), "setregset")
-            .await
-    }
-
-    pub async fn setsiginfo(&self, sig: siginfo_t) -> Result<()> {
-        self.send_cmd(move |pid| ptrace::setsiginfo(pid, &sig), "setsiginfo")
             .await
     }
 

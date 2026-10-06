@@ -14,7 +14,24 @@ pub enum PtraceRequest {
     Cmd(Box<dyn FnOnce() + Send>),
 }
 
+#[derive(Debug, Clone)]
+pub struct SigInfo {
+    pub si_signo: i32,
+    pub si_errno: i32,
+    pub si_code: i32,
+}
+
+impl From<siginfo_t> for SigInfo {
+    fn from(value: siginfo_t) -> Self {
+        Self {
+            si_signo: value.si_signo,
+            si_errno: value.si_errno,
+            si_code: value.si_code,
+        }
+    }
+}
+
 pub struct StopBatch {
-    pub events: Vec<(WaitStatus, Option<siginfo_t>)>,
+    pub events: Vec<(WaitStatus, Option<SigInfo>)>,
     pub was_interrupt: bool,
 }
