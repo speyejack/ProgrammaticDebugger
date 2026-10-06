@@ -16,7 +16,7 @@ use nix::{
 
 use crate::{
     Result,
-    comms::{PtraceRequest, StopBatch},
+    comms::{PtraceRequest, SigInfo, StopBatch},
     err::{FromOneshotRecv, FromPtraceExt, FromStdMpscSend},
     ptrace_thread::{INTERRUPT_SIGNAL, PtraceThread},
 };

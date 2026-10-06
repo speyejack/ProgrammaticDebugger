@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, mpsc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex, mpsc},
+};
 
 use crate::{
     Result,
@@ -19,6 +22,7 @@ pub const INTERRUPT_SIGNAL: Signal = Signal::SIGUSR1;
 
 pub struct PtraceThread {
     tracee_running: bool,
+    attached: HashSet<Pid>,
 
     interrupting: Arc<Mutex<bool>>,
     cmds: mpsc::Receiver<PtraceRequest>,
@@ -33,6 +37,7 @@ impl PtraceThread {
     ) -> Self {
         PtraceThread {
             tracee_running: false,
+            attached: HashSet::new(),
             interrupting,
             cmds,
             event_watch,
@@ -43,7 +48,7 @@ impl PtraceThread {
         use PtraceRequest::*;
         'event_loop: loop {
             if self.tracee_running {
-                tracing::debug!("PtraceThread waiting for tracee stop");
+                // tracing::debug!("PtraceThread waiting for tracee stop");
                 let batch = self.wait_stop(None);
                 if let Err(e) = self.event_watch.try_send(batch) {
                     tracing::debug!("PtraceThread closing due to event watch: {e}");
@@ -60,11 +65,17 @@ impl PtraceThread {
                         Cmd(func) => func(),
                         Seize(pid, options, sender) => {
                             let out = ptrace::seize(pid, options).with_err("seize", pid);
+                            if out.is_ok() {
+                                self.attached.insert(pid);
+                            }
                             let _ = sender.send(out);
                             break 'cmd_loop;
                         }
                         Attach(pid, sender) => {
                             let out = ptrace::attach(pid).with_err("attach", pid);
+                            if out.is_ok() {
+                                self.attached.insert(pid);
+                            }
                             let _ = sender.send(out);
                         }
                         Continue(pid, signal, sender) => {
@@ -107,7 +118,7 @@ impl PtraceThread {
         *lock = false;
         drop(lock);
 
-        tracing::trace!("Got event, stopping tracee");
+        // tracing::trace!("Got event, stopping tracee");
         let mut unhandled_interrupt = was_interrupt;
         loop {
             match event {
@@ -123,7 +134,7 @@ impl PtraceThread {
 
             event = self.wait_pid(pid, Some(WaitPidFlag::WNOHANG))?;
         }
-        tracing::trace!("Tracee stopped");
+        // tracing::trace!("Tracee stopped");
 
         Ok(StopBatch {
             events,
@@ -133,5 +144,13 @@ impl PtraceThread {
 
     fn wait_pid(&mut self, pid: Option<Pid>, flags: Option<WaitPidFlag>) -> Result<WaitStatus> {
         waitpid(pid, flags).with_err("waitpid", pid)
+    }
+}
+
+impl Drop for PtraceThread {
+    fn drop(&mut self) {
+        for attach_pid in &self.attached {
+            let _ = ptrace::detach(*attach_pid, None);
+        }
     }
 }
