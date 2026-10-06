@@ -63,7 +63,7 @@ impl HardwareBreakpoint {
     }
 
     pub(crate) fn d7_set(&self) -> i64 {
-        0b01 << (self.id * 2)  // Enable
+        (if self.is_enabled {1} else {0}) << (self.id * 2)  // Enable
             | 0b1 << (16 + self.id) // recommended to have this local exact breakpoint
             | self.condition.to_binary() << (16 + self.id * 2)
             | self.size.to_binary() << (18 + self.id * 2)
@@ -74,10 +74,10 @@ impl HardwareBreakpoint {
     }
 
     pub(crate) fn d7_mask_for_id(id: usize) -> i64 {
-        0b11 << (id * 2)  // Enable
+        !(0b11 << (id * 2)  // Enable
             | 0b1 << (16 + id) // recommended to have this local exact breakpoint
             | 0b11 << (16 + id * 2)
-            | 0b11 << (18 + id * 2)
+            | 0b11 << (18 + id * 2))
     }
 }
 
