@@ -77,6 +77,14 @@ impl PtraceThread {
                             let _ = sender.send(out);
                             break 'cmd_loop;
                         }
+                        Detach(pid, signal, sender) => {
+                            let out = ptrace::detach(pid, signal).with_err("detach", pid);
+                            if out.is_ok() {
+                                self.attached.remove(&pid);
+                            }
+                            let _ = sender.send(out);
+                            break 'event_loop;
+                        }
                     }
                 } else {
                     break 'event_loop;

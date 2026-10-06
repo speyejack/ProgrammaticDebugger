@@ -11,6 +11,7 @@ pub enum PtraceRequest {
     Seize(Pid, ptrace::Options, oneshot::Sender<Result<()>>),
     Continue(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
     Step(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
+    Detach(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
     Cmd(Box<dyn FnOnce() + Send>),
 }
 

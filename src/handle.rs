@@ -60,12 +60,10 @@ impl TraceeHandle {
             nix::sys::signal::kill(self.tracee_pid, INTERRUPT_SIGNAL)
                 .with_err("handle interrupting process", Some(self.tracee_pid))?;
         }
-        // let _ = self.alert_fd.write(1);
         Ok(())
     }
 
     // Taken from ptrace
-
     pub async fn attach(&self) -> Result<()> {
         let (send, recv) = oneshot::async_channel();
         self.cmds
@@ -108,6 +106,18 @@ impl TraceeHandle {
         recv.await.with_err("handle step cmd")?
     }
 
+    pub async fn detach<T>(self, sig: T) -> Result<()>
+    where
+        T: Into<Option<Signal>>,
+    {
+        let (send, recv) = oneshot::async_channel();
+        self.cmds
+            .send(PtraceRequest::Continue(self.tracee_pid, sig.into(), send))
+            .with_err("handle detach cmd")?;
+
+        recv.await.with_err("handle detach cmd")?
+    }
+
     pub async fn raw_attach(&self) -> Result<()> {
         self.send_cmd(move |pid| ptrace::attach(pid), "attach")
             .await
@@ -132,7 +142,7 @@ impl TraceeHandle {
             .await
     }
 
-    pub async fn detach<T>(self, sig: T) -> Result<()>
+    pub async fn raw_detach<T>(self, sig: T) -> Result<()>
     where
         T: Into<Option<Signal>>,
     {
