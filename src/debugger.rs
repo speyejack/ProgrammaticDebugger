@@ -101,7 +101,6 @@ impl Debugger {
 
                 event = self.event_recv.recv() => {
                     if let Ok(Ok(batch)) = event {
-                        tracing::debug!("Debugger got stop batch from proc thread");
 
                         let e = self.handle_stopping(batch).await;
 
@@ -112,7 +111,6 @@ impl Debugger {
                     }
                 }
                 event = self.recv.recv() => {
-                    tracing::debug!("Debugger got event from tasks");
                     match event {
                         Ok(event) => {
                             let o = self.handle_ext_event(event).await;
@@ -175,7 +173,7 @@ impl Debugger {
             }
         }
 
-        tracing::debug!("Handled all wait_pids");
+        tracing::trace!("Handled all wait_pids");
         self.is_stopped = true;
 
         // Handle hardware breakpoint
@@ -183,9 +181,10 @@ impl Debugger {
             let regs = self.handle.getregs().await?;
             while d6 > 0 {
                 let idx = d6.trailing_zeros() as usize;
-                tracing::trace!("Hw breakpoint {} being triggered", idx);
-                tracing::trace!("Breakpoints: {:?}", self.hw_bps);
-                if let Some((task_id, _hw_bk, sender)) = self.hw_bps[idx].as_mut() {
+                // tracing::trace!("Hw breakpoint {} being triggered", idx);
+                // tracing::trace!("Breakpoints: {:?}", self.hw_bps);
+                let mut should_delete = false;
+                if let Some((task_id, hw_bk, sender)) = self.hw_bps[idx].as_mut() {
                     if let Some(task_status) = self.tstatus.get_mut(task_id) {
                         *task_status = TaskStatus::Running;
                         sender
@@ -193,11 +192,21 @@ impl Debugger {
                             .await
                             .with_err("debugger resuming task on hw bp")?;
                     } else {
-                        // TODO: Reset & disable hw breakpoint. Replace with None in list
-                        todo!("Handle unlinked breakpoint")
+                        tracing::trace!("Handle unlinked breakpoint");
+                        should_delete = true;
                     }
                 } else {
-                    tracing::debug!("Hw breakpoint accessed without being setup");
+                    tracing::trace!("Hw breakpoint accessed without being setup");
+                    should_delete = true;
+                }
+
+                if should_delete {
+                    tracing::trace!("Attempting deletion of breakpoint");
+                    tracing::trace!("hw_bps: {:?}", self.hw_bps);
+                    let e = self.delete_breakpoint(idx).await;
+                    if let Err(e) = e {
+                        tracing::trace!("Failed to delete breakpoint: {e}");
+                    }
                 }
 
                 d6 >>= 1;
@@ -209,14 +218,14 @@ impl Debugger {
             }
         }
 
-        tracing::debug!("Handled hardware breakpoints");
+        tracing::trace!("Handled hardware breakpoints");
         // Handle Stepping
         if stepped {
             self.is_stepping = false;
             self.is_stopped = true;
             self.send_steps().await;
         }
-        tracing::debug!("Handled steps");
+        tracing::trace!("Handled steps");
 
         self.attempt_resume().await?;
         Ok(())
@@ -261,9 +270,10 @@ impl Debugger {
                 let _ = sender.send(());
             }
             DebuggerMessage::TaskDropped(id) => {
-                tracing::debug!("Debugger removing task");
+                tracing::debug!("Debugger dropping task");
 
                 self.tstatus.remove(&id);
+                let _ = self.attempt_resume().await;
             }
             DebuggerMessage::Continue((id, sender)) => {
                 tracing::debug!("Debugger got {id} wants continue");
@@ -334,21 +344,14 @@ impl Debugger {
 
                 let _ = sender.send(()).with_err("debugger modify hw bp reply");
             }
-            DebuggerMessage::DeleteHwBreakpoint((mut hw_bk, sender)) => {
+            DebuggerMessage::DeleteHwBreakpoint((hw_bk, sender)) => {
+                tracing::debug!("Debugger deleting hw breakpoint");
+
+                let e = self.delete_breakpoint(hw_bk.id).await;
+                if let Err(e) = e {
+                    tracing::debug!("Debugger failed to write d7: {e}");
+                }
                 tracing::debug!("Debugger deleted hw breakpoint");
-                let _local_bk = self.hw_bps[hw_bk.id]
-                    .take()
-                    .expect("Modified unset breakpoint");
-
-                hw_bk.is_enabled = false;
-                let mut d7 = self.handle.read_user(HardwareBreakpoint::d7_addr()).await?;
-                d7 &= hw_bk.d7_mask();
-                d7 |= hw_bk.d7_set();
-                let _ = self
-                    .handle
-                    .write_user(HardwareBreakpoint::d7_addr(), d7)
-                    .await;
-
                 sender.map(|s| s.send(()));
             }
             DebuggerMessage::GracefulShutdown => {
@@ -385,7 +388,7 @@ impl Debugger {
         // Handle any pending interrupts
         if !self.on_interrupt.is_empty() {
             self.send_interrupts().await;
-            tracing::debug!("Handled interrupts");
+            tracing::trace!("Handled interrupts");
             return Ok(());
         }
 
@@ -395,7 +398,7 @@ impl Debugger {
             .iter()
             .any(|(_, s)| !matches!(s, TaskStatus::Waiting))
         {
-            tracing::debug!("Cannot resume, waiting on tasks: {:?}", self.tstatus);
+            tracing::trace!("Cannot resume, waiting on tasks: {:?}", self.tstatus);
             return Ok(());
         }
 
@@ -421,15 +424,29 @@ impl Debugger {
             self.handle.step(None).await?;
             // Step requests handled after step
             self.is_stopped = false;
-            tracing::debug!("Resuming step");
+            tracing::trace!("Resuming step");
             return Ok(());
         }
 
-        tracing::debug!("Resuming cont");
-        // Handle any step requests
+        // Handle any continue requests
+        tracing::trace!("Resuming cont");
         self.handle.cont(None).await?;
         self.send_continues().await;
         self.is_stopped = false;
+        Ok(())
+    }
+
+    async fn delete_breakpoint(&mut self, idx: usize) -> Result<()> {
+        let _ = self.hw_bps[idx].take();
+
+        let hw_bk = HardwareBreakpoint::new(idx).set_enable(false);
+        let mut d7 = self.handle.read_user(HardwareBreakpoint::d7_addr()).await?;
+
+        d7 &= hw_bk.d7_mask();
+        let _ = self
+            .handle
+            .write_user(HardwareBreakpoint::d7_addr(), d7)
+            .await?;
         Ok(())
     }
 
