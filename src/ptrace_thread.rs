@@ -1,55 +1,90 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI32, AtomicU32, Ordering::Relaxed},
+        mpsc,
+    },
 };
 
 use crate::{
-    Result,
-    comms::{PtraceRequest, StopBatch},
+    DebuggerError, Result,
+    comms::{PtraceRunningRequest, PtraceStoppedRequest, StopBatch},
     err::FromPtraceExt,
 };
 
 use nix::{
     sys::{
         ptrace,
-        signal::Signal,
+        signal::{SaFlags, SigAction, SigHandler, SigSet, Signal},
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
     unistd::Pid,
 };
 
-pub const INTERRUPT_SIGNAL: Signal = Signal::SIGUSR1;
+pub const INTERRUPT_SIGNAL: Signal = Signal::SIGUSR2;
 
 pub struct PtraceThread {
     tracee_running: bool,
     attached: HashSet<Pid>,
+    thread_pid: Arc<AtomicI32>,
 
-    interrupting: Arc<Mutex<bool>>,
-    cmds: mpsc::Receiver<PtraceRequest>,
+    interrupting: bool,
+    stopped_cmds: mpsc::Receiver<PtraceStoppedRequest>,
+    running_cmds: mpsc::Receiver<PtraceRunningRequest>,
     event_watch: futures::channel::mpsc::Sender<Result<StopBatch>>,
 }
 
 impl PtraceThread {
     pub fn new(
-        interrupting: Arc<Mutex<bool>>,
-        cmds: mpsc::Receiver<PtraceRequest>,
+        running_cmds: mpsc::Receiver<PtraceRunningRequest>,
+        stopped_cmds: mpsc::Receiver<PtraceStoppedRequest>,
         event_watch: futures::channel::mpsc::Sender<Result<StopBatch>>,
     ) -> Self {
+        install_sig_handler();
         PtraceThread {
             tracee_running: false,
             attached: HashSet::new(),
-            interrupting,
-            cmds,
+            interrupting: false,
             event_watch,
+            running_cmds,
+            stopped_cmds,
+            thread_pid: Arc::new(AtomicI32::new(0)),
         }
     }
 
     pub fn event_loop(mut self) -> Result<()> {
-        use PtraceRequest::*;
+        self.thread_pid
+            .store(nix::unistd::gettid().as_raw(), Relaxed);
+        use PtraceStoppedRequest::*;
         'event_loop: loop {
             if self.tracee_running {
                 // tracing::debug!("PtraceThread waiting for tracee stop");
                 let batch = self.wait_stop(None);
+
+                // Handle non-interrupting command
+                if let Err(DebuggerError::Ptrace {
+                    code: nix::errno::Errno::EINTR,
+                    ..
+                }) = batch
+                {
+                    let recv_cmd = self.running_cmds.recv();
+                    if let Ok(cmd) = recv_cmd {
+                        match cmd {
+                            PtraceRunningRequest::RunCommand(fn_once) => fn_once(),
+                            PtraceRunningRequest::Interrupt(pid, sender) => {
+                                let out = ptrace::interrupt(pid).with_err("interrupt", pid);
+                                if out.is_ok() {
+                                    self.interrupting = true;
+                                }
+
+                                let _ = sender.send(out);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if let Err(e) = self.event_watch.try_send(batch) {
                     tracing::debug!("PtraceThread closing due to event watch: {e}");
                     break;
@@ -59,10 +94,10 @@ impl PtraceThread {
             }
 
             'cmd_loop: loop {
-                let recv_cmd = self.cmds.recv();
+                let recv_cmd = self.stopped_cmds.recv();
                 if let Ok(cmd) = recv_cmd {
                     match cmd {
-                        Cmd(func) => func(),
+                        IntCommand(func) => func(),
                         Seize(pid, options, sender) => {
                             let out = ptrace::seize(pid, options).with_err("seize", pid);
                             if out.is_ok() {
@@ -104,27 +139,26 @@ impl PtraceThread {
             self.tracee_running = true;
         }
 
+        self.thread_pid.store(0, Relaxed);
         tracing::info!("Ptrace Thread terminating");
         Ok(())
     }
 
+    // TODO: Allow stop to handle an error and a partial stop batch
     pub fn wait_stop(&mut self, pid: Option<Pid>) -> Result<StopBatch> {
         let mut events = Vec::new();
 
         let mut event = self.wait_pid(pid, Some(WaitPidFlag::empty()))?;
 
-        let mut lock = self.interrupting.lock().expect("Poisoned Interrupt Lock");
-        let was_interrupt = *lock;
-        *lock = false;
-        drop(lock);
+        let mut was_interrupt = false;
 
         // tracing::trace!("Got event, stopping tracee");
-        let mut unhandled_interrupt = was_interrupt;
         loop {
             match event {
                 WaitStatus::StillAlive => break,
-                WaitStatus::Stopped(_, sig) if unhandled_interrupt && sig == INTERRUPT_SIGNAL => {
-                    unhandled_interrupt = true;
+                WaitStatus::PtraceEvent(_, Signal::SIGINT, _) if self.interrupting => {
+                    self.interrupting = false;
+                    was_interrupt = true;
                 }
 
                 status => {
@@ -145,6 +179,21 @@ impl PtraceThread {
     fn wait_pid(&mut self, pid: Option<Pid>, flags: Option<WaitPidFlag>) -> Result<WaitStatus> {
         waitpid(pid, flags).with_err("waitpid", pid)
     }
+
+    pub fn get_tracee_pid(&self) -> Arc<AtomicI32> {
+        self.thread_pid.clone()
+    }
+}
+
+extern "C" fn handle_sig(_signal: nix::libc::c_int) {
+    // Noop, just to cause interrupt
+}
+pub fn install_sig_handler() {
+    let signal = INTERRUPT_SIGNAL;
+
+    let handler = SigHandler::Handler(handle_sig);
+    let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
+    unsafe { nix::sys::signal::sigaction(signal, &action) }.unwrap();
 }
 
 impl Drop for PtraceThread {

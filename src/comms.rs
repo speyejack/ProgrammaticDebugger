@@ -6,13 +6,18 @@ use nix::{
 
 use crate::Result;
 
-pub enum PtraceRequest {
+pub enum PtraceStoppedRequest {
     Attach(Pid, oneshot::Sender<Result<()>>),
     Seize(Pid, ptrace::Options, oneshot::Sender<Result<()>>),
     Continue(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
     Step(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
     Detach(Pid, Option<Signal>, oneshot::Sender<Result<()>>),
-    Cmd(Box<dyn FnOnce() + Send>),
+    IntCommand(Box<dyn FnOnce() + Send>),
+}
+
+pub enum PtraceRunningRequest {
+    RunCommand(Box<dyn FnOnce() + Send>),
+    Interrupt(Pid, oneshot::Sender<Result<()>>),
 }
 
 #[derive(Debug, Clone)]

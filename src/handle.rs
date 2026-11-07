@@ -1,6 +1,12 @@
 use std::{
     ffi::c_long,
-    sync::{Arc, Mutex, mpsc},
+    fs::OpenOptions,
+    os::unix::fs::FileExt,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI32, AtomicU32, Ordering::Relaxed},
+        mpsc,
+    },
 };
 
 use nix::{
@@ -11,21 +17,22 @@ use nix::{
         signal::Signal,
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
-    unistd::Pid,
+    unistd::{Pid, getpid},
 };
 
 use crate::{
-    Result,
-    comms::{PtraceRequest, SigInfo, StopBatch},
+    DebuggerError, Result,
+    comms::{PtraceRunningRequest, PtraceStoppedRequest, SigInfo, StopBatch},
     err::{FromOneshotRecv, FromPtraceExt, FromStdMpscSend},
     ptrace_thread::{INTERRUPT_SIGNAL, PtraceThread},
 };
 
 #[derive(Debug, Clone)]
 pub struct TraceeHandle {
-    pub interrupting: Arc<Mutex<bool>>,
     pub tracee_pid: Pid,
-    pub cmds: mpsc::Sender<PtraceRequest>,
+    pub tracer_tid: Arc<AtomicI32>,
+    pub stopped_cmds: mpsc::Sender<PtraceStoppedRequest>,
+    pub running_cmds: mpsc::Sender<PtraceRunningRequest>,
 }
 
 impl TraceeHandle {
@@ -36,38 +43,38 @@ impl TraceeHandle {
         PtraceThread,
         futures::channel::mpsc::Receiver<Result<StopBatch>>,
     )> {
-        let (send, recv) = mpsc::channel();
-        let interrupting = Arc::new(std::sync::Mutex::new(false));
+        let (run_send, run_recv) = mpsc::channel();
+        let (stop_send, stop_recv) = mpsc::channel();
         let (event_send, event_recv) = futures::channel::mpsc::channel(10);
-        let thread = PtraceThread::new(interrupting.clone(), recv, event_send);
+        let thread = PtraceThread::new(run_recv, stop_recv, event_send);
 
         let handle = TraceeHandle {
-            interrupting,
+            tracer_tid: thread.get_tracee_pid(),
             tracee_pid: pid,
-            cmds: send,
+            stopped_cmds: stop_send,
+            running_cmds: run_send,
         };
 
         Ok((handle, thread, event_recv))
     }
 
     pub async fn send_interrupt(&self) -> Result<()> {
-        let mut is_interrupting = self.interrupting.lock().expect("Poisoned Interrupt Lock");
+        let (send, recv) = oneshot::async_channel();
 
-        if !*is_interrupting {
-            *is_interrupting = true;
-            drop(is_interrupting);
-            tracing::debug!("Handle sending interrupt signal");
-            nix::sys::signal::kill(self.tracee_pid, INTERRUPT_SIGNAL)
-                .with_err("handle interrupting process", Some(self.tracee_pid))?;
-        }
-        Ok(())
+        self.running_cmds
+            .send(PtraceRunningRequest::Interrupt(self.tracee_pid, send))
+            .with_err("handle interrupt cmd")?;
+
+        self.wake_ptrace_thread()?;
+
+        recv.await.with_err("handle interrupt cmd")?
     }
 
     // Taken from ptrace
     pub async fn attach(&self) -> Result<()> {
         let (send, recv) = oneshot::async_channel();
-        self.cmds
-            .send(PtraceRequest::Attach(self.tracee_pid, send))
+        self.stopped_cmds
+            .send(PtraceStoppedRequest::Attach(self.tracee_pid, send))
             .with_err("handle attach cmd")?;
 
         recv.await.with_err("handle attach cmd")?
@@ -75,8 +82,8 @@ impl TraceeHandle {
 
     pub async fn seize(&self, options: ptrace::Options) -> Result<()> {
         let (send, recv) = oneshot::async_channel();
-        self.cmds
-            .send(PtraceRequest::Seize(self.tracee_pid, options, send))
+        self.stopped_cmds
+            .send(PtraceStoppedRequest::Seize(self.tracee_pid, options, send))
             .with_err("handle seize cmd")?;
 
         recv.await.with_err("handle seize cmd")?
@@ -87,8 +94,12 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let (send, recv) = oneshot::async_channel();
-        self.cmds
-            .send(PtraceRequest::Continue(self.tracee_pid, sig.into(), send))
+        self.stopped_cmds
+            .send(PtraceStoppedRequest::Continue(
+                self.tracee_pid,
+                sig.into(),
+                send,
+            ))
             .with_err("handle continue cmd")?;
 
         recv.await.with_err("handle continue cmd")?
@@ -99,8 +110,12 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let (send, recv) = oneshot::async_channel();
-        self.cmds
-            .send(PtraceRequest::Step(self.tracee_pid, sig.into(), send))
+        self.stopped_cmds
+            .send(PtraceStoppedRequest::Step(
+                self.tracee_pid,
+                sig.into(),
+                send,
+            ))
             .with_err("handle step cmd")?;
 
         recv.await.with_err("handle step cmd")?
@@ -111,15 +126,19 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let (send, recv) = oneshot::async_channel();
-        self.cmds
-            .send(PtraceRequest::Continue(self.tracee_pid, sig.into(), send))
+        self.stopped_cmds
+            .send(PtraceStoppedRequest::Continue(
+                self.tracee_pid,
+                sig.into(),
+                send,
+            ))
             .with_err("handle detach cmd")?;
 
         recv.await.with_err("handle detach cmd")?
     }
 
     pub async fn raw_attach(&self) -> Result<()> {
-        self.send_cmd(move |pid| ptrace::attach(pid), "attach")
+        self.send_stopped_cmd(move |pid| ptrace::attach(pid), "attach")
             .await
     }
 
@@ -128,7 +147,7 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let t = sig.into();
-        self.send_cmd(move |pid| ptrace::cont(pid, t), "continue")
+        self.send_stopped_cmd(move |pid| ptrace::cont(pid, t), "continue")
             .await
     }
 
@@ -138,7 +157,7 @@ impl TraceeHandle {
     {
         let options = flags.into();
 
-        self.send_cmd(move |pid| waitpid(pid, options), "waitpid")
+        self.send_stopped_cmd(move |pid| waitpid(pid, options), "waitpid")
             .await
     }
 
@@ -147,17 +166,17 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let t = sig.into();
-        self.send_cmd(move |pid| ptrace::detach(pid, t), "detach")
+        self.send_stopped_cmd(move |pid| ptrace::detach(pid, t), "detach")
             .await
     }
 
     pub async fn getevent(&self) -> Result<i64> {
-        self.send_cmd(move |pid| ptrace::getevent(pid), "getevent")
+        self.send_stopped_cmd(move |pid| ptrace::getevent(pid), "getevent")
             .await
     }
 
     pub async fn getregs(&self) -> Result<user_regs_struct> {
-        self.send_cmd(move |pid| ptrace::getregs(pid), "getregs")
+        self.send_stopped_cmd(move |pid| ptrace::getregs(pid), "getregs")
             .await
     }
 
@@ -165,12 +184,12 @@ impl TraceeHandle {
     where
         <S as RegisterSet>::Regs: Send + 'static,
     {
-        self.send_cmd(move |pid| ptrace::getregset::<S>(pid), "getregset")
+        self.send_stopped_cmd(move |pid| ptrace::getregset::<S>(pid), "getregset")
             .await
     }
 
     pub async fn getsiginfo(&self) -> Result<SigInfo> {
-        self.send_cmd(
+        self.send_stopped_cmd(
             move |pid| ptrace::getsiginfo(pid).map(|x| SigInfo::from(x)),
             "getsiginfo",
         )
@@ -178,21 +197,22 @@ impl TraceeHandle {
     }
 
     pub async fn raw_interrupt(&self) -> Result<()> {
-        self.send_cmd(move |pid| ptrace::interrupt(pid), "interrupt")
+        self.send_stopped_cmd(move |pid| ptrace::interrupt(pid), "interrupt")
             .await
     }
 
     pub async fn kill(self) -> Result<()> {
-        self.send_cmd(move |pid| ptrace::kill(pid), "kill").await
+        self.send_stopped_cmd(move |pid| ptrace::kill(pid), "kill")
+            .await
     }
 
     pub async fn read(&self, addr: u64) -> Result<c_long> {
-        self.send_cmd(move |pid| ptrace::read(pid, addr as AddressType), "read")
+        self.send_stopped_cmd(move |pid| ptrace::read(pid, addr as AddressType), "read")
             .await
     }
 
     pub async fn read_user(&self, offset: usize) -> Result<c_long> {
-        self.send_cmd(
+        self.send_stopped_cmd(
             move |pid| ptrace::read_user(pid, offset as AddressType),
             "read_user",
         )
@@ -200,17 +220,17 @@ impl TraceeHandle {
     }
 
     pub async fn raw_seize(&self, options: ptrace::Options) -> Result<()> {
-        self.send_cmd(move |pid| ptrace::seize(pid, options), "seize")
+        self.send_stopped_cmd(move |pid| ptrace::seize(pid, options), "seize")
             .await
     }
 
     pub async fn setoptions(&self, options: ptrace::Options) -> Result<()> {
-        self.send_cmd(move |pid| ptrace::setoptions(pid, options), "setoptions")
+        self.send_stopped_cmd(move |pid| ptrace::setoptions(pid, options), "setoptions")
             .await
     }
 
     pub async fn setregs(&self, regs: user_regs_struct) -> Result<()> {
-        self.send_cmd(move |pid| ptrace::setregs(pid, regs), "setregs")
+        self.send_stopped_cmd(move |pid| ptrace::setregs(pid, regs), "setregs")
             .await
     }
 
@@ -219,7 +239,7 @@ impl TraceeHandle {
         S: RegisterSet + Send + 'static,
         <S as RegisterSet>::Regs: Send + 'static,
     {
-        self.send_cmd(move |pid| ptrace::setregset::<S>(pid, regs), "setregset")
+        self.send_stopped_cmd(move |pid| ptrace::setregset::<S>(pid, regs), "setregset")
             .await
     }
 
@@ -228,7 +248,7 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let sig = sig.into();
-        self.send_cmd(move |pid| ptrace::step(pid, sig), "step")
+        self.send_stopped_cmd(move |pid| ptrace::step(pid, sig), "step")
             .await
     }
 
@@ -237,12 +257,12 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let sig = sig.into();
-        self.send_cmd(move |pid| ptrace::syscall(pid, sig), "syscall")
+        self.send_stopped_cmd(move |pid| ptrace::syscall(pid, sig), "syscall")
             .await
     }
 
     pub async fn syscall_info(&self) -> Result<ptrace_syscall_info> {
-        self.send_cmd(move |pid| ptrace::syscall_info(pid), "syscall_info")
+        self.send_stopped_cmd(move |pid| ptrace::syscall_info(pid), "syscall_info")
             .await
     }
 
@@ -251,7 +271,7 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let sig = sig.into();
-        self.send_cmd(move |pid| ptrace::sysemu(pid, sig), "sysemu")
+        self.send_stopped_cmd(move |pid| ptrace::sysemu(pid, sig), "sysemu")
             .await
     }
     pub async fn sysemu_step<T>(&self, sig: T) -> Result<()>
@@ -259,12 +279,12 @@ impl TraceeHandle {
         T: Into<Option<Signal>>,
     {
         let sig = sig.into();
-        self.send_cmd(move |pid| ptrace::sysemu_step(pid, sig), "sysemu_step")
+        self.send_stopped_cmd(move |pid| ptrace::sysemu_step(pid, sig), "sysemu_step")
             .await
     }
 
     pub async fn write(&self, addr: u64, data: c_long) -> Result<()> {
-        self.send_cmd(
+        self.send_stopped_cmd(
             move |pid| ptrace::write(pid, addr as AddressType, data),
             "write",
         )
@@ -272,14 +292,42 @@ impl TraceeHandle {
     }
 
     pub async fn write_user(&self, offset: usize, data: c_long) -> Result<()> {
-        self.send_cmd(
+        self.send_stopped_cmd(
             move |pid| ptrace::write_user(pid, offset as AddressType, data),
             "write_user",
         )
         .await
     }
 
-    async fn send_cmd<T, F>(&self, func: F, op: &'static str) -> Result<T>
+    pub async fn write_vec_memory(&self, addr: usize, data: Vec<u8>) -> Result<()> {
+        self.send_running_cmd(move |pid| {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("/proc/{}/mem", pid.as_raw()))
+                .map_err(|_| DebuggerError::Ptrace {
+                    op: "write_memory",
+                    pid,
+                    code: Errno::EPERM,
+                })?;
+
+            file.write_all_at(&data, addr as u64)
+                .map_err(|_| DebuggerError::Ptrace {
+                    op: "write_memory",
+                    pid,
+                    code: Errno::EPERM,
+                })
+        })
+        .await
+    }
+
+    fn wake_ptrace_thread(&self) -> Result<()> {
+        let pid = getpid();
+        let tracer_tid = Pid::from_raw(self.tracer_tid.load(Relaxed));
+        tgkill(pid, tracer_tid, INTERRUPT_SIGNAL).with_err("wake thread", pid)
+    }
+
+    async fn send_stopped_cmd<T, F>(&self, func: F, op: &'static str) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(Pid) -> std::result::Result<T, Errno> + Send + 'static,
@@ -292,12 +340,48 @@ impl TraceeHandle {
             let _ = send.send(res);
         };
 
-        self.cmds
-            .send(PtraceRequest::Cmd(Box::new(wrapper)))
+        self.stopped_cmds
+            .send(PtraceStoppedRequest::IntCommand(Box::new(wrapper)))
             .with_err("handle cmd")?;
+
+        self.wake_ptrace_thread()?;
 
         let data = recv.await.with_err("handle cmd")?;
 
         data
+    }
+
+    async fn send_running_cmd<T, F>(&self, func: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Pid) -> std::result::Result<T, DebuggerError> + Send + 'static,
+    {
+        let (send, recv) = oneshot::async_channel();
+
+        let pid = self.tracee_pid;
+        let wrapper = move || {
+            let res = func(pid);
+            let _ = send.send(res);
+        };
+
+        self.running_cmds
+            .send(PtraceRunningRequest::RunCommand(Box::new(wrapper)))
+            .with_err("handle cmd")?;
+        self.wake_ptrace_thread()?;
+
+        let data = recv.await.with_err("handle cmd")?;
+
+        data
+    }
+}
+
+fn tgkill(pid: Pid, tid: Pid, signal: Signal) -> std::result::Result<(), Errno> {
+    let result =
+        unsafe { nix::libc::syscall(nix::libc::SYS_tgkill, pid, tid, signal as nix::libc::c_int) };
+
+    if result == -1 {
+        Err(Errno::last())
+    } else {
+        Ok(())
     }
 }
