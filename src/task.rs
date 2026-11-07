@@ -174,6 +174,10 @@ impl Task {
 
         Ok(out.rax)
     }
+
+    pub async fn write_mem(&self, addr: usize, data: Vec<u8>) -> Result<()> {
+        self.debug_handle.write_vec_memory(addr, data).await
+    }
 }
 
 impl Drop for Task {
