@@ -65,7 +65,7 @@ pub(crate) enum DebuggerMessage {
 }
 
 impl Debugger {
-    pub async fn quick_setup(pid: Pid) -> Result<(Self, Spawner, PtraceThread)> {
+    pub fn quick_setup(pid: Pid) -> Result<(Self, Spawner, PtraceThread)> {
         let (handle, thread, event_recv) = TraceeHandle::setup_debugger(pid)?;
         let (send, recv) = futures::channel::mpsc::channel(10);
         let handle = Arc::new(handle);
