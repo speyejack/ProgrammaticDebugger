@@ -26,6 +26,7 @@ pub struct Debugger {
 
     is_stopped: bool,
     is_stepping: bool,
+    delayed_msgs: VecDeque<StoppedMessage>,
     on_interrupt: Vec<(TaskID, oneshot::Sender<Result<()>>)>,
     on_step: Vec<(TaskID, oneshot::Sender<()>)>,
     on_continue: Vec<(TaskID, oneshot::Sender<()>)>,
@@ -59,9 +60,13 @@ pub(crate) enum DebuggerMessage {
             oneshot::Sender<Option<(HardwareBreakpoint, mpsc::Receiver<user_regs_struct>)>>,
         ),
     ),
+    StoppedMessage(StoppedMessage),
+    GracefulShutdown,
+}
+
+pub(crate) enum StoppedMessage {
     ModifyHwBreakpoint((HardwareBreakpoint, oneshot::Sender<()>)),
     DeleteHwBreakpoint((HardwareBreakpoint, Option<oneshot::Sender<()>>)),
-    GracefulShutdown,
 }
 
 impl Debugger {
@@ -89,6 +94,7 @@ impl Debugger {
                 on_continue: Default::default(),
                 req_control: Default::default(),
                 hw_bps: [const { None }; 4],
+                delayed_msgs: Default::default(),
             },
             spawner,
             thread,
@@ -184,7 +190,7 @@ impl Debugger {
                 // tracing::trace!("Hw breakpoint {} being triggered", idx);
                 // tracing::trace!("Breakpoints: {:?}", self.hw_bps);
                 let mut should_delete = false;
-                if let Some((task_id, hw_bk, sender)) = self.hw_bps[idx].as_mut() {
+                if let Some((task_id, _hw_bk, sender)) = self.hw_bps[idx].as_mut() {
                     if let Some(task_status) = self.tstatus.get_mut(task_id) {
                         *task_status = TaskStatus::Running;
                         sender
@@ -211,14 +217,22 @@ impl Debugger {
 
                 d6 >>= 1;
             }
-            self.handle.write_user(d6o, 0x0).await?;
 
-            if !self.on_interrupt.is_empty() {
-                self.send_interrupts().await;
-            }
+            self.handle.write_user(d6o, 0x0).await?;
         }
 
         tracing::trace!("Handled hardware breakpoints");
+        while !self.delayed_msgs.is_empty() {
+            let msg = self.delayed_msgs.pop_front().unwrap();
+            let _ = self.handle_stopped_msg(msg).await;
+        }
+
+        if !self.on_interrupt.is_empty() {
+            self.send_interrupts().await;
+        }
+
+        tracing::trace!("Handled all msgs & interrupts");
+
         // Handle Stepping
         if stepped {
             self.is_stepping = false;
@@ -254,6 +268,7 @@ impl Debugger {
     async fn handle_ext_event(&mut self, event: DebuggerMessage) -> Result<bool> {
         // Likely this will be called during handling of running until waitpid & during waiting for tasks, continue & step shouldnt happen during waitpid/running.
         // during running.
+
         match event {
             DebuggerMessage::CreateNewTask(sender) => {
                 tracing::debug!("Debugger created task");
@@ -320,40 +335,6 @@ impl Debugger {
                     sender.send(None).with_err("debugger create hw bp reply")?
                 }
             }
-            DebuggerMessage::ModifyHwBreakpoint((hw_bk, sender)) => {
-                tracing::debug!("Debugger modified hw breakpoint");
-                let mut d7 = self.handle.read_user(HardwareBreakpoint::d7_addr()).await?;
-                // There may be a race condition if the program is still running or struct is run in
-                // concurrently
-
-                let mut local_bk = self.hw_bps[hw_bk.id]
-                    .take()
-                    .expect("Modified unset breakpoint");
-
-                d7 &= hw_bk.d7_mask();
-                d7 |= hw_bk.d7_set();
-                let _ = self
-                    .handle
-                    .write_user(HardwareBreakpoint::d7_addr(), d7)
-                    .await;
-                let _ = self.handle.write_user(hw_bk.dx_addr(), hw_bk.loc).await;
-
-                local_bk.1 = hw_bk;
-                let _ = self.hw_bps[hw_bk.id].insert(local_bk);
-                println!("Modified breakpoint");
-
-                let _ = sender.send(()).with_err("debugger modify hw bp reply");
-            }
-            DebuggerMessage::DeleteHwBreakpoint((hw_bk, sender)) => {
-                tracing::debug!("Debugger deleting hw breakpoint");
-
-                let e = self.delete_breakpoint(hw_bk.id).await;
-                if let Err(e) = e {
-                    tracing::debug!("Debugger failed to write d7: {e}");
-                }
-                tracing::debug!("Debugger deleted hw breakpoint");
-                sender.map(|s| s.send(()));
-            }
             DebuggerMessage::GracefulShutdown => {
                 if !self.is_stopped {
                     tracing::warn!("Tried shutdown debugger while running");
@@ -374,10 +355,57 @@ impl Debugger {
                 tracing::info!("Debugger shutting down");
                 return Ok(false);
             }
+            DebuggerMessage::StoppedMessage(stopped_message) => {
+                if self.is_stopped {
+                    self.handle_stopped_msg(stopped_message).await?;
+                } else {
+                    self.delayed_msgs.push_back(stopped_message);
+                    self.handle.send_interrupt().await?;
+                }
+            }
         }
 
         self.attempt_resume().await?;
         Ok(true)
+    }
+
+    async fn handle_stopped_msg(&mut self, msg: StoppedMessage) -> Result<()> {
+        match msg {
+            StoppedMessage::ModifyHwBreakpoint((hw_bk, sender)) => {
+                tracing::debug!("Debugger modified hw breakpoint");
+                let mut d7 = self.handle.read_user(HardwareBreakpoint::d7_addr()).await?;
+                // There may be a race condition if the program is still running or struct is run in
+                // concurrently
+
+                let mut local_bk = self.hw_bps[hw_bk.id]
+                    .take()
+                    .expect("Modified unset breakpoint");
+
+                d7 &= hw_bk.d7_mask();
+                d7 |= hw_bk.d7_set();
+                let _ = self
+                    .handle
+                    .write_user(HardwareBreakpoint::d7_addr(), d7)
+                    .await;
+                let _ = self.handle.write_user(hw_bk.dx_addr(), hw_bk.loc).await;
+
+                local_bk.1 = hw_bk;
+                let _ = self.hw_bps[hw_bk.id].insert(local_bk);
+
+                let _ = sender.send(()).with_err("debugger modify hw bp reply");
+            }
+            StoppedMessage::DeleteHwBreakpoint((hw_bk, sender)) => {
+                tracing::debug!("Debugger deleting hw breakpoint");
+
+                let e = self.delete_breakpoint(hw_bk.id).await;
+                if let Err(e) = e {
+                    tracing::debug!("Debugger failed to write d7: {e}");
+                }
+                tracing::debug!("Debugger deleted hw breakpoint");
+                sender.map(|s| s.send(()));
+            }
+        }
+        Ok(())
     }
 
     async fn attempt_resume(&mut self) -> Result<()> {

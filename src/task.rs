@@ -11,7 +11,7 @@ use nix::sys::mman::{MapFlags, ProtFlags};
 use crate::{
     Result, TraceeHandle,
     breakpoint::HardwareBreakpoint,
-    debugger::{DebuggerMessage, TaskID},
+    debugger::{DebuggerMessage, StoppedMessage, TaskID},
     err::{FromMpscSend, FromOneshotRecv},
 };
 
@@ -228,7 +228,9 @@ impl TaskBkPt {
 
         let (send, reply) = oneshot::channel();
         self.sender
-            .send(DebuggerMessage::ModifyHwBreakpoint((bp, send)))
+            .send(DebuggerMessage::StoppedMessage(
+                StoppedMessage::ModifyHwBreakpoint((bp, send)),
+            ))
             .await
             .with_err("breakpoint modify")?;
         Ok(reply.await.with_err("breakpoint modify")?)
@@ -238,7 +240,9 @@ impl TaskBkPt {
         self.bk_pt = bp;
         let (send, reply) = oneshot::channel();
         self.sender
-            .send(DebuggerMessage::DeleteHwBreakpoint((bp, Some(send))))
+            .send(DebuggerMessage::StoppedMessage(
+                StoppedMessage::DeleteHwBreakpoint((bp, Some(send))),
+            ))
             .await
             .with_err("breakpoint delete")?;
         Ok(reply.await.with_err("breakpoint delete")?)
@@ -251,8 +255,8 @@ impl TaskBkPt {
 
 impl Drop for TaskBkPt {
     fn drop(&mut self) {
-        let _ = self
-            .sender
-            .try_send(DebuggerMessage::DeleteHwBreakpoint((self.bk_pt, None)));
+        let _ = self.sender.try_send(DebuggerMessage::StoppedMessage(
+            StoppedMessage::DeleteHwBreakpoint((self.bk_pt, None)),
+        ));
     }
 }
