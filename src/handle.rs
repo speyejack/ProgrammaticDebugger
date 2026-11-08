@@ -3,15 +3,15 @@ use std::{
     fs::OpenOptions,
     os::unix::fs::FileExt,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicI32, AtomicU32, Ordering::Relaxed},
+        Arc,
+        atomic::{AtomicI32, Ordering::Relaxed},
         mpsc,
     },
 };
 
 use nix::{
     errno::Errno,
-    libc::{ptrace_syscall_info, siginfo_t, user_regs_struct},
+    libc::{ptrace_syscall_info, user_regs_struct},
     sys::{
         ptrace::{self, AddressType, RegisterSet},
         signal::Signal,

@@ -1,8 +1,8 @@
 use std::{
     collections::HashSet,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicI32, AtomicU32, Ordering::Relaxed},
+        Arc,
+        atomic::{AtomicI32, Ordering::Relaxed},
         mpsc,
     },
 };

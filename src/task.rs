@@ -231,7 +231,6 @@ impl TaskBkPt {
             .send(DebuggerMessage::ModifyHwBreakpoint((bp, send)))
             .await
             .with_err("breakpoint modify")?;
-        println!("Send msg");
         Ok(reply.await.with_err("breakpoint modify")?)
     }
 
